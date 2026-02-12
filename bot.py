@@ -5,25 +5,25 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-# ================== CONFIG ==================
+# ================= CONFIG =================
 TOKEN = os.getenv("TOKEN")
 if not TOKEN:
     raise RuntimeError("DISCORD TOKEN MISSING")
 
-DB_PATH = "bot.db"
+DB_PATH = "steam_bot.db"
 
 MEMBER_ROLE_ID = 1471512804535046237
 BOOSTER_ROLE_ID = 1469733875709378674
 BOOSTER_ROLE_2_ID = 1471590464279810210
 STAFF_ROLE_ID = 1471515890225774663
-# ============================================
+# =========================================
 
 intents = discord.Intents.default()
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ================== DATABASE ==================
+# ================= DATABASE =================
 def db():
     return sqlite3.connect(DB_PATH)
 
@@ -58,7 +58,7 @@ def init_db():
     con.commit()
     con.close()
 
-# ================== HELPERS ==================
+# ================= HELPERS =================
 def has_role(member, role_id):
     return any(r.id == role_id for r in member.roles)
 
@@ -89,36 +89,40 @@ def used_today(user_id):
     con.close()
     return count
 
-# ================== EVENTS ==================
+def staff_only(interaction):
+    return has_role(interaction.user, STAFF_ROLE_ID)
+
+# ================= EVENTS =================
 @bot.event
 async def on_ready():
     init_db()
     await bot.tree.sync()
     print(f"✅ Logged in as {bot.user}")
 
-# ================== USER COMMANDS ==================
+# ================= USER COMMANDS =================
 @bot.tree.command(name="steamaccount", description="Generate a Steam account")
 @app_commands.describe(game="Game name")
 async def steamaccount(interaction: discord.Interaction, game: str):
-    member = interaction.user
+    user = interaction.user
 
-    if not has_role(member, MEMBER_ROLE_ID):
-        await interaction.response.send_message("❌ You are not a member.", ephemeral=True)
+    if not has_role(user, MEMBER_ROLE_ID):
+        await interaction.response.send_message("❌ Members only.", ephemeral=True)
         return
 
-    limit = daily_limit(member)
-    used = used_today(member.id)
+    limit = daily_limit(user)
+    used = used_today(user.id)
 
     if used >= limit:
         await interaction.response.send_message(
-            f"⛔ Daily limit reached ({limit}/day).", ephemeral=True
+            f"⛔ Daily limit reached ({limit}/day).",
+            ephemeral=True
         )
         return
 
     con = db()
     cur = con.cursor()
     cur.execute(
-        "SELECT id, username, password, games FROM accounts WHERE used=0 AND games LIKE ? LIMIT 1",
+        "SELECT id, username, password FROM accounts WHERE used=0 AND games LIKE ? LIMIT 1",
         (f"%{game}%",)
     )
     row = cur.fetchone()
@@ -128,16 +132,13 @@ async def steamaccount(interaction: discord.Interaction, game: str):
         con.close()
         return
 
-    acc_id, user, pwd, games = row
+    acc_id, usern, pwd = row
     cur.execute("UPDATE accounts SET used=1 WHERE id=?", (acc_id,))
-    cur.execute(
-        "INSERT INTO gens VALUES (?, ?)",
-        (member.id, date.today().isoformat())
-    )
+    cur.execute("INSERT INTO gens VALUES (?, ?)", (user.id, date.today().isoformat()))
     con.commit()
     con.close()
 
-    await member.send(f"🎮 **{game} Account**\n```{user}:{pwd}```")
+    await user.send(f"🎮 **{game} Account**\n```{usern}:{pwd}```")
     await interaction.response.send_message("📩 Sent to your DMs.", ephemeral=True)
 
 @bot.tree.command(name="listgames", description="List available games")
@@ -159,6 +160,21 @@ async def listgames(interaction: discord.Interaction):
             ephemeral=True
         )
 
+@bot.tree.command(name="search", description="Search for a game")
+async def search(interaction: discord.Interaction, game: str):
+    con = db()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT COUNT(*) FROM accounts WHERE used=0 AND games LIKE ?",
+        (f"%{game}%",)
+    )
+    count = cur.fetchone()[0]
+    con.close()
+    await interaction.response.send_message(
+        f"🔎 `{game}` accounts: {count}",
+        ephemeral=True
+    )
+
 @bot.tree.command(name="stock", description="Check total stock")
 async def stock(interaction: discord.Interaction):
     con = db()
@@ -166,28 +182,50 @@ async def stock(interaction: discord.Interaction):
     cur.execute("SELECT COUNT(*) FROM accounts WHERE used=0")
     count = cur.fetchone()[0]
     con.close()
-    await interaction.response.send_message(f"📦 Stock: {count}", ephemeral=True)
+    await interaction.response.send_message(f"📦 Stock remaining: {count}", ephemeral=True)
 
 @bot.tree.command(name="mystats", description="View your stats")
 async def mystats(interaction: discord.Interaction):
     used = used_today(interaction.user.id)
     limit = daily_limit(interaction.user)
     await interaction.response.send_message(
-        f"📊 Used today: {used}/{limit}", ephemeral=True
+        f"📊 Used today: {used}/{limit}",
+        ephemeral=True
     )
+
+@bot.tree.command(name="topusers", description="Today's leaderboard")
+async def topusers(interaction: discord.Interaction):
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT user_id, COUNT(*) 
+        FROM gens 
+        WHERE day=? 
+        GROUP BY user_id 
+        ORDER BY COUNT(*) DESC 
+        LIMIT 10
+    """, (date.today().isoformat(),))
+    rows = cur.fetchall()
+    con.close()
+
+    if not rows:
+        await interaction.response.send_message("No activity today.", ephemeral=True)
+        return
+
+    msg = "\n".join(f"<@{u}> — {c}" for u, c in rows)
+    await interaction.response.send_message(msg, ephemeral=True)
 
 @bot.tree.command(name="boostinfo", description="Boost perks")
 async def boostinfo(interaction: discord.Interaction):
     await interaction.response.send_message(
         "💎 **Boost Perks**\n"
-        "• No Boost → 2/day\n"
-        "• 1 Boost → 4/day\n"
-        "• 2 Boosts → 6/day",
+        "No Boost → 2/day\n"
+        "1 Boost → 4/day\n"
+        "2 Boosts → 6/day",
         ephemeral=True
     )
 
 @bot.tree.command(name="report", description="Report a bad account")
-@app_commands.describe(account="username:password", reason="Reason")
 async def report(interaction: discord.Interaction, account: str, reason: str):
     con = db()
     cur = con.cursor()
@@ -205,14 +243,10 @@ async def report(interaction: discord.Interaction, account: str, reason: str):
     cur.execute("INSERT INTO reports VALUES (?, ?)", (row[0], reason))
     con.commit()
     con.close()
-
     await interaction.response.send_message("✅ Report submitted.", ephemeral=True)
 
-# ================== STAFF COMMANDS ==================
-def staff_only(interaction):
-    return has_role(interaction.user, STAFF_ROLE_ID)
-
-@bot.tree.command(name="addaccount", description="Add a Steam account")
+# ================= STAFF COMMANDS =================
+@bot.tree.command(name="addaccount", description="Add one account")
 @app_commands.check(staff_only)
 async def addaccount(interaction: discord.Interaction, username: str, password: str, games: str):
     con = db()
@@ -225,27 +259,103 @@ async def addaccount(interaction: discord.Interaction, username: str, password: 
     con.close()
     await interaction.response.send_message("✅ Account added.", ephemeral=True)
 
+@bot.tree.command(name="bulkadd", description="Bulk add accounts")
+@app_commands.check(staff_only)
+async def bulkadd(interaction: discord.Interaction, games: str, accounts: str):
+    lines = [l for l in accounts.split("\n") if ":" in l]
+    con = db()
+    cur = con.cursor()
+
+    for line in lines:
+        u, p = line.strip().split(":", 1)
+        cur.execute(
+            "INSERT INTO accounts (username, password, games) VALUES (?, ?, ?)",
+            (u, p, games)
+        )
+
+    con.commit()
+    con.close()
+    await interaction.response.send_message(f"✅ Added {len(lines)} accounts.", ephemeral=True)
+
+@bot.tree.command(name="removeaccount", description="Remove an account")
+@app_commands.check(staff_only)
+async def removeaccount(interaction: discord.Interaction, account: str):
+    con = db()
+    cur = con.cursor()
+    cur.execute(
+        "DELETE FROM accounts WHERE username || ':' || password = ?",
+        (account,)
+    )
+    con.commit()
+    con.close()
+    await interaction.response.send_message("🗑️ Account removed.", ephemeral=True)
+
+@bot.tree.command(name="accountinfo", description="Check account info")
+@app_commands.check(staff_only)
+async def accountinfo(interaction: discord.Interaction, account: str):
+    con = db()
+    cur = con.cursor()
+    cur.execute(
+        "SELECT id, used FROM accounts WHERE username || ':' || password = ?",
+        (account,)
+    )
+    row = cur.fetchone()
+    con.close()
+
+    if not row:
+        await interaction.response.send_message("❌ Not found.", ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            f"ID: {row[0]} | Used: {'Yes' if row[1] else 'No'}",
+            ephemeral=True
+        )
+
 @bot.tree.command(name="reportedaccounts", description="View reported accounts")
 @app_commands.check(staff_only)
 async def reportedaccounts(interaction: discord.Interaction):
     con = db()
     cur = con.cursor()
-    cur.execute(
-        "SELECT a.username, a.password, COUNT(r.account_id) "
-        "FROM accounts a JOIN reports r ON a.id=r.account_id "
-        "GROUP BY a.id"
-    )
+    cur.execute("""
+        SELECT a.username, a.password, COUNT(r.account_id)
+        FROM accounts a
+        JOIN reports r ON a.id = r.account_id
+        GROUP BY a.id
+    """)
     rows = cur.fetchall()
     con.close()
 
     if not rows:
-        await interaction.response.send_message("✅ No reports.", ephemeral=True)
+        await interaction.response.send_message("No reports.", ephemeral=True)
         return
 
     msg = "\n".join(f"{u}:{p} — {c} reports" for u, p, c in rows)
     await interaction.response.send_message(msg, ephemeral=True)
 
-@bot.tree.command(name="globalstats", description="View global stats")
+@bot.tree.command(name="resetreport", description="Clear reports for one account")
+@app_commands.check(staff_only)
+async def resetreport(interaction: discord.Interaction, account: str):
+    con = db()
+    cur = con.cursor()
+    cur.execute(
+        "DELETE FROM reports WHERE account_id IN "
+        "(SELECT id FROM accounts WHERE username || ':' || password = ?)",
+        (account,)
+    )
+    con.commit()
+    con.close()
+    await interaction.response.send_message("✅ Reports cleared.", ephemeral=True)
+
+@bot.tree.command(name="resetallreports", description="Clear all reports")
+@app_commands.check(staff_only)
+async def resetallreports(interaction: discord.Interaction):
+    con = db()
+    cur = con.cursor()
+    cur.execute("DELETE FROM reports")
+    con.commit()
+    con.close()
+    await interaction.response.send_message("✅ All reports wiped.", ephemeral=True)
+
+@bot.tree.command(name="globalstats", description="Global stats")
 @app_commands.check(staff_only)
 async def globalstats(interaction: discord.Interaction):
     con = db()
@@ -263,23 +373,30 @@ async def globalstats(interaction: discord.Interaction):
         ephemeral=True
     )
 
-# ================== HELP ==================
+# ================= HELP =================
 @bot.tree.command(name="help", description="Show all commands")
 async def help_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(
         "**🎮 User Commands**\n"
         "/steamaccount\n"
         "/listgames\n"
+        "/search\n"
         "/stock\n"
         "/mystats\n"
+        "/topusers\n"
         "/boostinfo\n"
         "/report\n\n"
         "**👨‍💼 Staff Commands**\n"
         "/addaccount\n"
+        "/bulkadd\n"
+        "/removeaccount\n"
+        "/accountinfo\n"
         "/reportedaccounts\n"
+        "/resetreport\n"
+        "/resetallreports\n"
         "/globalstats",
         ephemeral=True
     )
 
-# ================== START ==================
+# ================= START =================
 bot.run(TOKEN)
