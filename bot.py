@@ -1,323 +1,306 @@
 import os
-import asyncio
+import discord
 import aiosqlite
+from discord import app_commands
+from discord.ext import commands
 from datetime import datetime, date
 
-import discord
-from discord.ext import commands
-
-# ────────────────── CONFIG ──────────────────
-
-TOKEN = os.environ.get("TOKEN") or os.environ.get("DISCORD_TOKEN")
-
-BOOSTER_ROLE_ID = int(os.environ.get("BOOSTER_ROLE_ID", 0))
-MEMBER_ROLE_ID  = int(os.environ.get("MEMBER_ROLE_ID", 0))
-STAFF_ROLE_ID   = int(os.environ.get("STAFF_ROLE_ID", 0))
-
-DB_PATH = os.environ.get("DATABASE_PATH", "bot.db")
-
+# =========================
+# TOKEN (Railway)
+# =========================
+TOKEN = os.getenv("TOKEN")
 if not TOKEN:
-    print("❌ TOKEN NOT FOUND")
-    raise SystemExit(1)
+    raise RuntimeError("TOKEN NOT FOUND")
 
-# ────────────────── BOT ──────────────────
+# =========================
+# ROLE IDS (YOUR IDS)
+# =========================
+BOOSTER_ROLE_ID = 1469733875709378674
+MEMBER_ROLE_ID  = 1471512804535046237
+STAFF_ROLE_ID   = 1471515890225774663
 
+DB_PATH = "bot.db"
+
+# =========================
+# BOT SETUP
+# =========================
 intents = discord.Intents.default()
-intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ────────────────── DATABASE ──────────────────
-
+# =========================
+# DATABASE
+# =========================
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.executescript("""
+        await db.execute("""
         CREATE TABLE IF NOT EXISTS accounts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT,
             password TEXT,
             games TEXT,
             used INTEGER DEFAULT 0
-        );
-
+        )
+        """)
+        await db.execute("""
         CREATE TABLE IF NOT EXISTS gens (
-            user_id TEXT,
+            user_id INTEGER,
+            account_id INTEGER,
             created_at TEXT
-        );
-
+        )
+        """)
+        await db.execute("""
         CREATE TABLE IF NOT EXISTS reports (
-            account TEXT,
-            reporter TEXT,
-            reason TEXT
-        );
-
+            account_id INTEGER,
+            reporter_id INTEGER,
+            reason TEXT,
+            created_at TEXT
+        )
+        """)
+        await db.execute("""
         CREATE TABLE IF NOT EXISTS referrals (
-            owner_id TEXT,
-            code TEXT UNIQUE,
+            owner_id INTEGER UNIQUE,
+            code TEXT,
             uses INTEGER DEFAULT 0
-        );
-
+        )
+        """)
+        await db.execute("""
         CREATE TABLE IF NOT EXISTS referral_uses (
-            referrer_id TEXT,
-            referred_id TEXT
-        );
+            referrer_id INTEGER,
+            referred_id INTEGER
+        )
         """)
         await db.commit()
 
-# ────────────────── HELPERS ──────────────────
+# =========================
+# READY
+# =========================
+@bot.event
+async def on_ready():
+    await init_db()
+    await bot.tree.sync()
+    print(f"✅ Logged in as {bot.user}")
 
-def is_staff(member: discord.Member):
-    return (
-        member.guild_permissions.manage_guild
-        or any(r.id == STAFF_ROLE_ID for r in member.roles)
-    )
+# =========================
+# HELPERS
+# =========================
+def has_role(member, role_id):
+    return any(r.id == role_id for r in member.roles)
 
-def boost_count(member: discord.Member):
-    return 1 if any(r.id == BOOSTER_ROLE_ID for r in member.roles) else 0
-
-async def daily_gens(user_id: int):
+async def daily_gens(user_id):
     today = date.today().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT COUNT(*) FROM gens WHERE user_id=? AND DATE(created_at)=?",
-            (str(user_id), today),
+            (user_id, today)
         )
         return (await cur.fetchone())[0]
 
-# ────────────────── EVENTS ──────────────────
+def daily_limit(member):
+    return 4 if has_role(member, BOOSTER_ROLE_ID) else 2
 
-@bot.event
-async def on_ready():
-    await init_db()
-    print(f"✅ Logged in as {bot.user}")
+# =========================
+# USER COMMANDS
+# =========================
 
-# ────────────────── USER COMMANDS ──────────────────
+@bot.tree.command(name="steamaccount")
+@app_commands.describe(game="Game name")
+async def steamaccount(interaction: discord.Interaction, game: str):
+    if not has_role(interaction.user, MEMBER_ROLE_ID):
+        await interaction.response.send_message("❌ Member role required.", ephemeral=True)
+        return
 
-@bot.command()
-async def steamaccount(ctx, *, game: str):
-    limit = 2
-    if boost_count(ctx.author) == 1:
-        limit = 4
+    used = await daily_gens(interaction.user.id)
+    limit = daily_limit(interaction.user)
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT COUNT(*) FROM referral_uses WHERE referred_id=?",
-            (str(ctx.author.id),),
-        )
-        if (await cur.fetchone())[0] > 0:
-            limit += 1
-
-    if await daily_gens(ctx.author.id) >= limit:
-        return await ctx.reply(f"❌ Daily limit reached ({limit})")
+    if used >= limit:
+        await interaction.response.send_message(f"❌ Daily limit reached ({limit}).", ephemeral=True)
+        return
 
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, username, password, games FROM accounts WHERE used=0 AND games LIKE ? LIMIT 1",
-            (f"%{game}%",),
+            "SELECT id, username, password FROM accounts WHERE used=0 AND games LIKE ? LIMIT 1",
+            (f"%{game}%",)
         )
         row = await cur.fetchone()
-
         if not row:
-            return await ctx.reply("❌ No accounts available")
+            await interaction.response.send_message("❌ No stock for that game.", ephemeral=True)
+            return
 
-        acc_id, u, p, g = row
-
+        acc_id, u, p = row
         await db.execute("UPDATE accounts SET used=1 WHERE id=?", (acc_id,))
         await db.execute(
-            "INSERT INTO gens VALUES (?,?)",
-            (str(ctx.author.id), datetime.utcnow().isoformat()),
+            "INSERT INTO gens VALUES (?, ?, ?)",
+            (interaction.user.id, acc_id, datetime.utcnow().isoformat())
         )
         await db.commit()
 
-    try:
-        await ctx.author.send(f"🎮 **{game}**\n```{u}:{p}```\nGames: {g}")
-        await ctx.reply("✅ Check your DMs!")
-    except discord.Forbidden:
-        await ctx.reply(f"⚠️ DMs closed: `{u}:{p}`")
+    await interaction.user.send(f"🎮 **{game}**\n```{u}:{p}```")
+    await interaction.response.send_message("📩 Sent to DMs.", ephemeral=True)
 
-@bot.command()
-async def listgames(ctx):
+@bot.tree.command(name="listgames")
+async def listgames(interaction: discord.Interaction):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT DISTINCT games FROM accounts WHERE used=0")
         rows = await cur.fetchall()
 
     games = set()
     for (g,) in rows:
-        if g:
-            games.update(x.strip() for x in g.split(","))
+        for part in g.split(","):
+            games.add(part.strip())
 
-    await ctx.reply(", ".join(sorted(games)) if games else "❌ No stock")
+    await interaction.response.send_message(
+        "🎮 Available games:\n" + ", ".join(sorted(games)),
+        ephemeral=True
+    )
 
-@bot.command()
-async def search(ctx, *, game: str):
+@bot.tree.command(name="search")
+@app_commands.describe(game="Game name")
+async def search(interaction: discord.Interaction, game: str):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT COUNT(*) FROM accounts WHERE used=0 AND games LIKE ?",
-            (f"%{game}%",),
+            (f"%{game}%",)
         )
         count = (await cur.fetchone())[0]
-    await ctx.reply(f"🔎 {count} account(s) found")
+    await interaction.response.send_message(f"Found {count} account(s).", ephemeral=True)
 
-@bot.command()
-async def stock(ctx):
+@bot.tree.command(name="stock")
+async def stock(interaction: discord.Interaction):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT COUNT(*) FROM accounts WHERE used=0")
         count = (await cur.fetchone())[0]
-    await ctx.reply(f"📦 Stock: {count}")
+    await interaction.response.send_message(f"📦 Stock: {count}", ephemeral=True)
 
-@bot.command()
-async def mystats(ctx):
+@bot.tree.command(name="mystats")
+async def mystats(interaction: discord.Interaction):
     async with aiosqlite.connect(DB_PATH) as db:
-        gens = (await (await db.execute(
-            "SELECT COUNT(*) FROM gens WHERE user_id=?",
-            (str(ctx.author.id),),
-        )).fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM gens WHERE user_id=?", (interaction.user.id,))
+        gens = (await cur.fetchone())[0]
+    await interaction.response.send_message(f"📊 You generated {gens} accounts.", ephemeral=True)
 
-        refs = (await (await db.execute(
-            "SELECT COUNT(*) FROM referrals WHERE owner_id=?",
-            (str(ctx.author.id),),
-        )).fetchone())[0]
+@bot.tree.command(name="boostinfo")
+async def boostinfo(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "💎 Boost Perks:\n"
+        "No Boost → 2/day\n"
+        "Booster → 4/day",
+        ephemeral=True
+    )
 
-    await ctx.reply(f"📊 Gens: {gens} | Referrals: {refs}")
-
-@bot.command()
-async def topusers(ctx):
-    today = date.today().isoformat()
+@bot.tree.command(name="report")
+@app_commands.describe(account="username:password", reason="Reason")
+async def report(interaction: discord.Interaction, account: str, reason: str):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT user_id, COUNT(*) FROM gens WHERE DATE(created_at)=? GROUP BY user_id ORDER BY COUNT(*) DESC LIMIT 10",
-            (today,),
+            "SELECT id FROM accounts WHERE username||':'||password=?",
+            (account,)
         )
+        row = await cur.fetchone()
+        if not row:
+            await interaction.response.send_message("Account not found.", ephemeral=True)
+            return
+
+        await db.execute(
+            "INSERT INTO reports VALUES (?, ?, ?, ?)",
+            (row[0], interaction.user.id, reason, datetime.utcnow().isoformat())
+        )
+        await db.commit()
+
+    await interaction.response.send_message("✅ Report submitted.", ephemeral=True)
+
+# =========================
+# STAFF COMMANDS
+# =========================
+
+@bot.tree.command(name="addaccount")
+@app_commands.describe(username="Username", password="Password", games="Comma separated")
+async def addaccount(interaction: discord.Interaction, username: str, password: str, games: str):
+    if not has_role(interaction.user, STAFF_ROLE_ID):
+        await interaction.response.send_message("Staff only.", ephemeral=True)
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO accounts (username, password, games) VALUES (?, ?, ?)",
+            (username, password, games)
+        )
+        await db.commit()
+
+    await interaction.response.send_message("✅ Account added.", ephemeral=True)
+
+@bot.tree.command(name="bulkadd")
+@app_commands.describe(data="user:pass | user:pass")
+async def bulkadd(interaction: discord.Interaction, data: str):
+    if not has_role(interaction.user, STAFF_ROLE_ID):
+        await interaction.response.send_message("Staff only.", ephemeral=True)
+        return
+
+    entries = [e.strip() for e in data.split("|") if ":" in e]
+    async with aiosqlite.connect(DB_PATH) as db:
+        for e in entries:
+            u, p = e.split(":", 1)
+            await db.execute(
+                "INSERT INTO accounts (username, password, games) VALUES (?, ?, '')",
+                (u, p)
+            )
+        await db.commit()
+
+    await interaction.response.send_message(f"✅ Added {len(entries)} accounts.", ephemeral=True)
+
+@bot.tree.command(name="reportedaccounts")
+async def reportedaccounts(interaction: discord.Interaction):
+    if not has_role(interaction.user, STAFF_ROLE_ID):
+        await interaction.response.send_message("Staff only.", ephemeral=True)
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+        SELECT a.username, a.password, COUNT(r.account_id)
+        FROM accounts a JOIN reports r ON a.id=r.account_id
+        GROUP BY a.id
+        """)
         rows = await cur.fetchall()
 
     if not rows:
-        return await ctx.reply("❌ No activity today")
-
-    msg = "\n".join(f"<@{u}> — {c}" for u, c in rows)
-    await ctx.reply(msg)
-
-@bot.command()
-async def refer(ctx, code: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT owner_id FROM referrals WHERE code=?", (code,))
-        row = await cur.fetchone()
-        if not row or row[0] == str(ctx.author.id):
-            return await ctx.reply("❌ Invalid code")
-
-        await db.execute(
-            "INSERT INTO referral_uses VALUES (?,?)",
-            (row[0], str(ctx.author.id)),
-        )
-        await db.commit()
-
-    await ctx.reply("🎁 Referral applied (+1 daily gen)")
-
-@bot.command()
-async def boostinfo(ctx):
-    await ctx.reply(
-        "💎 Boost Perks\n"
-        "No Boost → 2/day\n"
-        "1 Boost → 4/day\n"
-        "2 Boosts → 6/day\n"
-        "Referrals → +1"
-    )
-
-@bot.command()
-async def report(ctx, account: str, *, reason=""):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO reports VALUES (?,?,?)",
-            (account, str(ctx.author.id), reason),
-        )
-        await db.commit()
-    await ctx.reply("🚨 Report submitted")
-
-# ────────────────── STAFF COMMANDS ──────────────────
-
-@bot.command()
-async def addaccount(ctx, user: str, pwd: str, *, games: str):
-    if not is_staff(ctx.author):
+        await interaction.response.send_message("No reports.", ephemeral=True)
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO accounts (username,password,games) VALUES (?,?,?)",
-            (user, pwd, games),
-        )
-        await db.commit()
-    await ctx.reply("✅ Account added")
+    msg = "\n".join(f"{u}:{p} — {c} reports" for u,p,c in rows)
+    await interaction.response.send_message(msg, ephemeral=True)
 
-@bot.command()
-async def bulkadd(ctx):
-    if not is_staff(ctx.author):
-        return await ctx.reply("❌ Staff only")
-
-    await ctx.reply("📥 Send accounts (user:pass | games), type `done` to finish")
-
-    def check(m): return m.author == ctx.author
-
-    while True:
-        msg = await bot.wait_for("message", check=check)
-        if msg.content.lower() == "done":
-            break
-        try:
-            creds, games = msg.content.split("|")
-            u, p = creds.strip().split(":")
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    "INSERT INTO accounts (username,password,games) VALUES (?,?,?)",
-                    (u, p, games.strip()),
-                )
-                await db.commit()
-        except:
-            await ctx.send("❌ Format error")
-
-    await ctx.reply("✅ Bulk add complete")
-
-@bot.command()
-async def reportedaccounts(ctx):
-    if not is_staff(ctx.author):
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT account, COUNT(*) FROM reports GROUP BY account")
-        rows = await cur.fetchall()
-
-    await ctx.reply("\n".join(f"{a} — {c}" for a, c in rows) or "None")
-
-@bot.command()
-async def resetreport(ctx, account: str):
-    if not is_staff(ctx.author):
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM reports WHERE account=?", (account,))
-        await db.commit()
-    await ctx.reply("🧹 Reports cleared")
-
-@bot.command()
-async def resetallreports(ctx):
-    if not is_staff(ctx.author):
+@bot.tree.command(name="resetallreports")
+async def resetallreports(interaction: discord.Interaction):
+    if not has_role(interaction.user, STAFF_ROLE_ID):
+        await interaction.response.send_message("Staff only.", ephemeral=True)
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM reports")
         await db.commit()
-    await ctx.reply("🧹 All reports wiped")
 
-@bot.command()
-async def globalstats(ctx):
-    if not is_staff(ctx.author):
+    await interaction.response.send_message("✅ Reports cleared.", ephemeral=True)
+
+@bot.tree.command(name="globalstats")
+async def globalstats(interaction: discord.Interaction):
+    if not has_role(interaction.user, STAFF_ROLE_ID):
+        await interaction.response.send_message("Staff only.", ephemeral=True)
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
-        a = (await (await db.execute("SELECT COUNT(*) FROM accounts")).fetchone())[0]
-        g = (await (await db.execute("SELECT COUNT(*) FROM gens")).fetchone())[0]
-        r = (await (await db.execute("SELECT COUNT(*) FROM reports")).fetchone())[0]
+        gens = (await (await db.execute("SELECT COUNT(*) FROM gens")).fetchone())[0]
+        reports = (await (await db.execute("SELECT COUNT(*) FROM reports")).fetchone())[0]
+        accs = (await (await db.execute("SELECT COUNT(*) FROM accounts")).fetchone())[0]
 
-    await ctx.reply(f"🌍 Accounts: {a}\nGens: {g}\nReports: {r}")
+    await interaction.response.send_message(
+        f"📊 Total gens: {gens}\n"
+        f"🚨 Reports: {reports}\n"
+        f"📦 Accounts: {accs}",
+        ephemeral=True
+    )
 
-# ────────────────── START ──────────────────
-
+# =========================
+# RUN
+# =========================
 bot.run(TOKEN)
