@@ -1,11 +1,12 @@
 import os
 import sqlite3
-import threading
 from datetime import date
+
 import discord
 from discord import app_commands
 from discord.ext import commands
-from flask import Flask, send_from_directory
+
+from flask import Flask
 
 # ================= CONFIG =================
 TOKEN = os.getenv("TOKEN")
@@ -20,24 +21,7 @@ BOOSTER_ROLE_2_ID = 1471590464279810210
 STAFF_ROLE_ID = 1471515890225774663
 # =========================================
 
-# ================= WEB SERVER =================
-app = Flask(__name__, static_folder=".")
-
-@app.route("/")
-def home():
-    return send_from_directory(".", "index.html")
-
-@app.route("/health")
-def health():
-    return "OK"
-
-def run_web():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
-
-threading.Thread(target=run_web, daemon=True).start()
-
-# ================= DISCORD BOT =================
+# ================= DISCORD =================
 intents = discord.Intents.default()
 intents.members = True
 
@@ -50,6 +34,7 @@ def db():
 def init_db():
     con = db()
     cur = con.cursor()
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS accounts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,18 +44,21 @@ def init_db():
         used INTEGER DEFAULT 0
     )
     """)
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS gens (
         user_id INTEGER,
         day TEXT
     )
     """)
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS reports (
         account_id INTEGER,
         reason TEXT
     )
     """)
+
     con.commit()
     con.close()
 
@@ -81,7 +69,11 @@ def has_role(member, role_id):
 def daily_limit(member):
     if has_role(member, STAFF_ROLE_ID):
         return 999
-    boosts = int(has_role(member, BOOSTER_ROLE_ID)) + int(has_role(member, BOOSTER_ROLE_2_ID))
+    boosts = 0
+    if has_role(member, BOOSTER_ROLE_ID):
+        boosts += 1
+    if has_role(member, BOOSTER_ROLE_2_ID):
+        boosts += 1
     return 6 if boosts >= 2 else 4 if boosts == 1 else 2
 
 def used_today(user_id):
@@ -106,117 +98,95 @@ async def on_ready():
     print(f"✅ Logged in as {bot.user}")
 
 # ================= USER COMMANDS =================
-@bot.tree.command(name="steamaccount")
+@bot.tree.command(name="steamaccount", description="Generate a Steam account")
 async def steamaccount(interaction: discord.Interaction, game: str):
-    user = interaction.user
-
-    if not has_role(user, MEMBER_ROLE_ID):
+    if not has_role(interaction.user, MEMBER_ROLE_ID):
         await interaction.response.send_message("❌ Members only.", ephemeral=True)
         return
 
-    if used_today(user.id) >= daily_limit(user):
+    if used_today(interaction.user.id) >= daily_limit(interaction.user):
         await interaction.response.send_message("⛔ Daily limit reached.", ephemeral=True)
         return
 
     con = db()
     cur = con.cursor()
-    cur.execute("SELECT id, username, password FROM accounts WHERE used=0 AND games LIKE ? LIMIT 1", (f"%{game}%",))
+    cur.execute(
+        "SELECT id, username, password FROM accounts WHERE used=0 AND games LIKE ? LIMIT 1",
+        (f"%{game}%",)
+    )
     row = cur.fetchone()
 
     if not row:
-        await interaction.response.send_message("❌ No accounts available.", ephemeral=True)
+        await interaction.response.send_message("❌ No stock available.", ephemeral=True)
         con.close()
         return
 
     acc_id, u, p = row
     cur.execute("UPDATE accounts SET used=1 WHERE id=?", (acc_id,))
-    cur.execute("INSERT INTO gens VALUES (?, ?)", (user.id, date.today().isoformat()))
+    cur.execute("INSERT INTO gens VALUES (?, ?)", (interaction.user.id, date.today().isoformat()))
     con.commit()
     con.close()
 
-    await user.send(f"🎮 **{game} Account**\n```{u}:{p}```")
+    await interaction.user.send(f"🎮 **{game} Account**\n```{u}:{p}```")
     await interaction.response.send_message("📩 Sent to your DMs.", ephemeral=True)
 
-@bot.tree.command(name="listgames")
+@bot.tree.command(name="listgames", description="List available games")
 async def listgames(interaction: discord.Interaction):
     con = db()
     cur = con.cursor()
     cur.execute("SELECT DISTINCT games FROM accounts WHERE used=0")
-    games = sorted(set(g.strip() for row in cur.fetchall() for g in row[0].split(",")))
+    games = set()
+    for (g,) in cur.fetchall():
+        for part in g.split(","):
+            games.add(part.strip())
     con.close()
-    await interaction.response.send_message(", ".join(games) or "No games available.", ephemeral=True)
 
-@bot.tree.command(name="stock")
-async def stock(interaction: discord.Interaction):
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT COUNT(*) FROM accounts WHERE used=0")
-    count = cur.fetchone()[0]
-    con.close()
-    await interaction.response.send_message(f"📦 Stock: {count}", ephemeral=True)
-
-@bot.tree.command(name="boostinfo")
-async def boostinfo(interaction: discord.Interaction):
     await interaction.response.send_message(
-        "💎 **Boost Perks**\nNo Boost → 2/day\n1 Boost → 4/day\n2 Boosts → 6/day",
+        "🎮 Games:\n" + "\n".join(sorted(games)) if games else "No stock.",
         ephemeral=True
     )
 
-@bot.tree.command(name="help")
+@bot.tree.command(name="help", description="Show all commands")
 async def help_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(
         "**🎮 User Commands**\n"
-        "/steamaccount\n/listgames\n/stock\n/boostinfo\n\n"
+        "/steamaccount\n"
+        "/listgames\n"
+        "/search\n"
+        "/stock\n"
+        "/mystats\n"
+        "/topusers\n"
+        "/boostinfo\n"
+        "/report\n\n"
         "**👨‍💼 Staff Commands**\n"
-        "/addaccount\n/bulkadd\n/removeaccount\n/globalstats",
+        "/addaccount\n"
+        "/bulkadd\n"
+        "/removeaccount\n"
+        "/accountinfo\n"
+        "/reportedaccounts\n"
+        "/resetreport\n"
+        "/resetallreports\n"
+        "/globalstats",
         ephemeral=True
     )
 
-# ================= STAFF COMMANDS =================
-@bot.tree.command(name="addaccount")
-@app_commands.check(staff_only)
-async def addaccount(interaction: discord.Interaction, username: str, password: str, games: str):
-    con = db()
-    cur = con.cursor()
-    cur.execute("INSERT INTO accounts (username, password, games) VALUES (?, ?, ?)", (username, password, games))
-    con.commit()
-    con.close()
-    await interaction.response.send_message("✅ Account added.", ephemeral=True)
+# ================= FLASK (RAILWAY) =================
+app = Flask(__name__)
 
-@bot.tree.command(name="bulkadd")
-@app_commands.check(staff_only)
-async def bulkadd(interaction: discord.Interaction, games: str, accounts: str):
-    con = db()
-    cur = con.cursor()
-    lines = [l for l in accounts.split("\n") if ":" in l]
-    for l in lines:
-        u, p = l.split(":", 1)
-        cur.execute("INSERT INTO accounts (username, password, games) VALUES (?, ?, ?)", (u, p, games))
-    con.commit()
-    con.close()
-    await interaction.response.send_message(f"✅ Added {len(lines)} accounts.", ephemeral=True)
+@app.route("/")
+def home():
+    return "Bot is running ✅"
 
-@bot.tree.command(name="removeaccount")
-@app_commands.check(staff_only)
-async def removeaccount(interaction: discord.Interaction, account: str):
-    con = db()
-    cur = con.cursor()
-    cur.execute("DELETE FROM accounts WHERE username || ':' || password = ?", (account,))
-    con.commit()
-    con.close()
-    await interaction.response.send_message("🗑️ Account removed.", ephemeral=True)
+@app.route("/health")
+def health():
+    return "OK"
 
-@bot.tree.command(name="globalstats")
-@app_commands.check(staff_only)
-async def globalstats(interaction: discord.Interaction):
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT COUNT(*) FROM gens")
-    gens = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM accounts")
-    accounts = cur.fetchone()[0]
-    con.close()
-    await interaction.response.send_message(f"📊 Gens: {gens}\n📦 Accounts: {accounts}", ephemeral=True)
+if __name__ == "__main__":
+    import threading
 
-# ================= START BOT (MUST BE LAST) =================
-bot.run(TOKEN)
+    def run_flask():
+        port = int(os.environ.get("PORT", 8080))
+        app.run(host="0.0.0.0", port=port)
+
+    threading.Thread(target=run_flask, daemon=True).start()
+    bot.run(TOKEN)
