@@ -238,9 +238,12 @@ async def steamaccount(interaction: discord.Interaction, game: str):
     # Create embed for DM
     embed = discord.Embed(
         title="🎮 Generated Steam Account",
-        description="Silent gen has agreed to only distribute accounts they own. Silent Gen takes no responsibility for what you do with these accounts.",
+        description="Crimson gen has agreed to only distribute accounts they own. Crimson Gen takes no responsibility for what you do with these accounts.",
         color=discord.Color.blue()
     )
+    
+    # Add Crimson gen thumbnail
+    embed.set_thumbnail(url="https://cdn.discordapp.com/attachments/1470798856085307423/1471984801266532362/IMG_7053.gif")
     
     embed.add_field(
         name="🔐 Account Details",
