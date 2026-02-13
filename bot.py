@@ -112,28 +112,38 @@ def used_today(user_id):
 def staff_only(interaction: discord.Interaction):
     return has_role(interaction.user, STAFF_ROLE_ID)
 
-# ================= FILE PARSER (FIXED) =================
+# ================= FILE PARSER (IMPROVED) =================
 def parse_account_line(line: str):
+    """
+    Parse account line in format: username:password | GAMES: game1, game2
+    Returns (username, password, games) or None if invalid
+    """
     line = line.strip()
     if not line:
         return None
 
     lower = line.lower()
+    # Skip lines with no valid games
     if "login ok" in lower or "detay yok" in lower or "oyun bulunamadı" in lower:
         return None
 
+    # Clean up the line
     line = line.replace("GAMES:", "").replace("Games:", "").replace("games:", "")
     line = line.replace(" | ", "|").replace(" - ", "|")
 
     if ":" not in line:
         return None
 
-    creds, *rest = line.split("|", 1)
+    # Split credentials from games
+    parts = line.split("|", 1)
+    creds = parts[0].strip()
+    
     if ":" not in creds:
         return None
 
+    # Extract username and password
     user, pwd = creds.split(":", 1)
-    games = rest[0].strip() if rest else "Unknown"
+    games = parts[1].strip() if len(parts) > 1 else "Unknown"
 
     if not user.strip() or not pwd.strip():
         return None
@@ -146,6 +156,7 @@ async def on_ready():
     init_db()
     await bot.tree.sync()
     print(f"✅ Logged in as {bot.user}")
+
 # ================= PAGINATION VIEW =================
 class GameView(discord.ui.View):
     def __init__(self, user_id, pages):
@@ -394,6 +405,7 @@ async def report(interaction: discord.Interaction, account: str, reason: str = "
         "🚨 Report submitted.",
         ephemeral=True
     )
+
 # ================= STAFF COMMANDS =================
 
 @bot.tree.command(name="addaccount", description="Add account(s) from file")
@@ -409,14 +421,26 @@ async def addaccount(interaction: discord.Interaction, file: discord.Attachment)
 
     added = 0
     skipped = 0
+    empty_lines = 0
+    no_games = 0
 
     with db() as con:
         cur = con.cursor()
-        for line in text.splitlines():
+        for line_num, line in enumerate(text.splitlines(), 1):
+            if not line.strip():
+                empty_lines += 1
+                continue
+                
             parsed = parse_account_line(line)
             if not parsed:
-                skipped += 1
+                # Check why it was skipped
+                lower = line.lower()
+                if "oyun bulunamadı" in lower or "login ok" in lower or "detay yok" in lower:
+                    no_games += 1
+                else:
+                    skipped += 1
                 continue
+                
             user, pwd, games = parsed
             try:
                 cur.execute(
@@ -424,14 +448,20 @@ async def addaccount(interaction: discord.Interaction, file: discord.Attachment)
                     (user, pwd, games)
                 )
                 added += 1
-            except Exception:
+            except Exception as e:
                 skipped += 1
         con.commit()
 
-    await interaction.followup.send(
-        f"✅ Added **{added}** account(s).\n"
-        f"⚠️ Skipped **{skipped}** line(s)."
-    )
+    msg = f"📂 **Upload Complete**\n"
+    msg += f"✅ Added: **{added}**\n"
+    if no_games > 0:
+        msg += f"⚠️ No games: **{no_games}**\n"
+    if skipped > 0:
+        msg += f"❌ Skipped: **{skipped}**\n"
+    if empty_lines > 0:
+        msg += f"📄 Empty lines: **{empty_lines}**"
+
+    await interaction.followup.send(msg)
 
 @bot.tree.command(name="bulkadd", description="Bulk add accounts from file")
 @app_commands.check(staff_only)
@@ -446,13 +476,24 @@ async def bulkadd(interaction: discord.Interaction, file: discord.Attachment):
 
     added = 0
     skipped = 0
+    empty_lines = 0
+    no_games = 0
 
     with db() as con:
         cur = con.cursor()
-        for line in text.splitlines():
+        for line_num, line in enumerate(text.splitlines(), 1):
+            if not line.strip():
+                empty_lines += 1
+                continue
+                
             parsed = parse_account_line(line)
             if not parsed:
-                skipped += 1
+                # Check why it was skipped
+                lower = line.lower()
+                if "oyun bulunamadı" in lower or "login ok" in lower or "detay yok" in lower:
+                    no_games += 1
+                else:
+                    skipped += 1
                 continue
 
             user, pwd, games = parsed
@@ -462,15 +503,20 @@ async def bulkadd(interaction: discord.Interaction, file: discord.Attachment):
                     (user, pwd, games)
                 )
                 added += 1
-            except Exception:
+            except Exception as e:
                 skipped += 1
         con.commit()
 
-    await interaction.followup.send(
-        f"📂 **Bulk Upload Complete**\n"
-        f"✅ Added: **{added}**\n"
-        f"❌ Skipped: **{skipped}**"
-    )
+    msg = f"📂 **Bulk Upload Complete**\n"
+    msg += f"✅ Added: **{added}**\n"
+    if no_games > 0:
+        msg += f"⚠️ No games: **{no_games}**\n"
+    if skipped > 0:
+        msg += f"❌ Invalid format: **{skipped}**\n"
+    if empty_lines > 0:
+        msg += f"📄 Empty lines: **{empty_lines}**"
+
+    await interaction.followup.send(msg)
 
 @bot.tree.command(name="removeaccount", description="Remove an account")
 @app_commands.check(staff_only)
