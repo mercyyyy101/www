@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
-import sqlite3
+import sqlite3, random, string
+from datetime import datetime
 
 app = FastAPI()
 DB = "steam_bot.db"
@@ -8,27 +9,32 @@ DB = "steam_bot.db"
 def db():
     return sqlite3.connect(DB)
 
+def gen_code():
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+
 @app.get("/", response_class=HTMLResponse)
 def home():
-    with open("index.html", "r") as f:
+    with open("index.html") as f:
         return f.read()
 
-@app.post("/use-referral")
-def use_referral(user_id: int, code: str):
+@app.post("/generate-code")
+def generate_code(user_id: int):
     con = db()
     cur = con.cursor()
 
-    cur.execute("SELECT owner_id FROM referrals WHERE code=?", (code,))
+    # one code per user
+    cur.execute("SELECT code FROM referrals WHERE owner_id=?", (user_id,))
     row = cur.fetchone()
-    if not row:
-        return {"error": "Invalid code"}
+    if row:
+        con.close()
+        return {"code": row[0]}
 
-    cur.execute("SELECT 1 FROM referral_uses WHERE user_id=?", (user_id,))
-    if cur.fetchone():
-        return {"error": "Already used"}
-
-    cur.execute("INSERT INTO referral_uses VALUES (?)", (user_id,))
+    code = gen_code()
+    cur.execute(
+        "INSERT INTO referrals VALUES (?, ?, ?)",
+        (code, user_id, datetime.utcnow().isoformat())
+    )
     con.commit()
     con.close()
 
-    return {"success": True}
+    return {"code": code}
