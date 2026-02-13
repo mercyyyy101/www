@@ -1,15 +1,15 @@
 import os
 import sqlite3
-import discord
-from discord.ext import commands
-from discord import app_commands
-from datetime import date
 import random
+from datetime import date
+import discord
+from discord import app_commands
+from discord.ext import commands
 
 # ================= CONFIG =================
 TOKEN = os.getenv("TOKEN")
 if not TOKEN:
-    raise RuntimeError("TOKEN missing")
+    raise RuntimeError("DISCORD TOKEN MISSING")
 
 DB_PATH = "steam_bot.db"
 
@@ -17,10 +17,11 @@ MEMBER_ROLE_ID = 1471512804535046237
 BOOSTER_ROLE_ID = 1469733875709378674
 BOOSTER_ROLE_2_ID = 1471590464279810210
 STAFF_ROLE_ID = 1471515890225774663
-# ========================================
+# =========================================
 
 intents = discord.Intents.default()
 intents.members = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ================= DATABASE =================
@@ -28,237 +29,535 @@ def db():
     return sqlite3.connect(DB_PATH)
 
 def init_db():
-    con = db()
-    cur = con.cursor()
+    with db() as con:
+        cur = con.cursor()
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS accounts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT,
-        password TEXT,
-        games TEXT,
-        used INTEGER DEFAULT 0
-    )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT,
+            password TEXT,
+            games TEXT,
+            used INTEGER DEFAULT 0
+        )
+        """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS gens (
-        user_id INTEGER,
-        day TEXT
-    )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS gens (
+            user_id INTEGER,
+            day TEXT
+        )
+        """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS reports (
-        account TEXT,
-        reason TEXT
-    )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS reports (
+            account TEXT,
+            reason TEXT
+        )
+        """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS referrals (
-        user_id INTEGER,
-        code TEXT UNIQUE
-    )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS referrals (
+            owner_id INTEGER,
+            code TEXT UNIQUE
+        )
+        """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS referral_uses (
-        user_id INTEGER UNIQUE
-    )""")
-
-    con.commit()
-    con.close()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS referral_uses (
+            user_id INTEGER UNIQUE
+        )
+        """)
 
 # ================= HELPERS =================
 def has_role(member, role_id):
     return any(r.id == role_id for r in member.roles)
 
+def base_limit(member):
+    boosts = 0
+    if has_role(member, BOOSTER_ROLE_ID):
+        boosts += 1
+    if has_role(member, BOOSTER_ROLE_2_ID):
+        boosts += 1
+
+    if boosts == 1:
+        return 4
+    if boosts >= 2:
+        return 6
+    return 2
+
+def has_referral(user_id):
+    with db() as con:
+        cur = con.cursor()
+        cur.execute("SELECT 1 FROM referral_uses WHERE user_id=?", (user_id,))
+        return cur.fetchone() is not None
+
 def daily_limit(member):
     if has_role(member, STAFF_ROLE_ID):
         return 999
-    limit = 2
-    if has_role(member, BOOSTER_ROLE_ID):
-        limit = 4
-    if has_role(member, BOOSTER_ROLE_2_ID):
-        limit = 6
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT 1 FROM referral_uses WHERE user_id=?", (member.id,))
-    if cur.fetchone():
+    limit = base_limit(member)
+    if has_referral(member.id):
         limit += 1
-    con.close()
     return limit
 
 def used_today(user_id):
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT COUNT(*) FROM gens WHERE user_id=? AND day=?",
-                (user_id, date.today().isoformat()))
-    count = cur.fetchone()[0]
-    con.close()
-    return count
+    with db() as con:
+        cur = con.cursor()
+        cur.execute(
+            "SELECT COUNT(*) FROM gens WHERE user_id=? AND day=?",
+            (user_id, date.today().isoformat())
+        )
+        return cur.fetchone()[0]
 
-def staff_only(i: discord.Interaction):
-    return has_role(i.user, STAFF_ROLE_ID)
+def staff_only(interaction: discord.Interaction):
+    return has_role(interaction.user, STAFF_ROLE_ID)
+
+# ================= FILE PARSER (FIXED) =================
+def parse_account_line(line: str):
+    line = line.strip()
+    if not line:
+        return None
+
+    lower = line.lower()
+    if "login ok" in lower or "detay yok" in lower or "oyun bulunamadı" in lower:
+        return None
+
+    line = line.replace("GAMES:", "").replace("Games:", "").replace("games:", "")
+    line = line.replace(" | ", "|").replace(" - ", "|")
+
+    if ":" not in line:
+        return None
+
+    creds, *rest = line.split("|", 1)
+    if ":" not in creds:
+        return None
+
+    user, pwd = creds.split(":", 1)
+    games = rest[0].strip() if rest else "Unknown"
+
+    if not user.strip() or not pwd.strip():
+        return None
+
+    return user.strip(), pwd.strip(), games.strip()
 
 # ================= EVENTS =================
 @bot.event
 async def on_ready():
     init_db()
     await bot.tree.sync()
-    print("Bot ready")
+    print(f"✅ Logged in as {bot.user}")
+# ================= PAGINATION VIEW =================
+class GameView(discord.ui.View):
+    def __init__(self, user_id, pages):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.pages = pages
+        self.index = 0
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "❌ These buttons are not for you.",
+                ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def prev(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index -= 1
+        self.update()
+        await interaction.response.edit_message(
+            content=self.pages[self.index],
+            view=self
+        )
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index += 1
+        self.update()
+        await interaction.response.edit_message(
+            content=self.pages[self.index],
+            view=self
+        )
+
+    def update(self):
+        self.prev.disabled = self.index == 0
+        self.next.disabled = self.index == len(self.pages) - 1
 
 # ================= USER COMMANDS =================
 
-@bot.tree.command()
+@bot.tree.command(name="steamaccount", description="Generate a Steam account for a game")
 async def steamaccount(interaction: discord.Interaction, game: str):
-    await interaction.response.defer(ephemeral=True)
+    used = used_today(interaction.user.id)
+    limit = daily_limit(interaction.user)
 
-    if used_today(interaction.user.id) >= daily_limit(interaction.user):
-        await interaction.followup.send("❌ Daily limit reached")
+    if used >= limit:
+        await interaction.response.send_message(
+            f"❌ Daily limit reached ({limit}/day).",
+            ephemeral=True
+        )
         return
 
-    con = db()
-    cur = con.cursor()
-    cur.execute(
-        "SELECT id, username, password FROM accounts WHERE used=0 AND games LIKE ?",
-        (f"%{game}%",)
-    )
-    row = cur.fetchone()
-    if not row:
-        await interaction.followup.send("❌ No stock for that game")
-        con.close()
-        return
+    with db() as con:
+        cur = con.cursor()
+        cur.execute(
+            "SELECT id, username, password FROM accounts "
+            "WHERE used=0 AND games LIKE ? ORDER BY RANDOM() LIMIT 1",
+            (f"%{game}%",)
+        )
+        row = cur.fetchone()
 
-    cur.execute("UPDATE accounts SET used=1 WHERE id=?", (row[0],))
-    cur.execute("INSERT INTO gens VALUES (?,?)",
-                (interaction.user.id, date.today().isoformat()))
-    con.commit()
-    con.close()
+        if not row:
+            await interaction.response.send_message(
+                "❌ No accounts available for that game.",
+                ephemeral=True
+            )
+            return
 
-    await interaction.followup.send(
-        f"🎮 **{game}**\n```{row[1]}:{row[2]}```"
-    )
+        acc_id, user, pwd = row
+        cur.execute("UPDATE accounts SET used=1 WHERE id=?", (acc_id,))
+        cur.execute(
+            "INSERT INTO gens VALUES (?,?)",
+            (interaction.user.id, date.today().isoformat())
+        )
 
-@bot.tree.command()
-async def listgames(interaction: discord.Interaction):
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT games FROM accounts WHERE used=0")
-    games = sorted({g.strip() for (row,) in cur.fetchall() for g in row.split(",")})
-    con.close()
     await interaction.response.send_message(
-        "🎮 **Available Games**\n" + "\n".join(games) if games else "No stock"
+        f"🎮 **Steam Account Generated**\n"
+        f"**Login:** `{user}:{pwd}`",
+        ephemeral=True
     )
 
-@bot.tree.command()
-async def search(interaction: discord.Interaction, game: str):
-    con = db()
-    cur = con.cursor()
-    cur.execute(
-        "SELECT COUNT(*) FROM accounts WHERE used=0 AND games LIKE ?",
-        (f"%{game}%",)
-    )
-    count = cur.fetchone()[0]
-    con.close()
-    await interaction.response.send_message(f"📦 **{game}**: {count}")
+@bot.tree.command(name="listgames", description="View available games")
+async def listgames(interaction: discord.Interaction):
+    with db() as con:
+        cur = con.cursor()
+        cur.execute("SELECT DISTINCT games FROM accounts WHERE used=0")
+        rows = cur.fetchall()
 
-@bot.tree.command()
-async def stock(interaction: discord.Interaction):
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT games FROM accounts WHERE used=0")
-    counts = {}
-    for (row,) in cur.fetchall():
-        for g in row.split(","):
-            counts[g.strip()] = counts.get(g.strip(), 0) + 1
-    con.close()
+    games = sorted({
+        g.strip()
+        for (row,) in rows
+        for g in row.split(",")
+        if g.strip()
+    })
 
-    msg = "\n".join(f"{g}: {c}" for g, c in counts.items())
-    await interaction.response.send_message(msg or "No stock")
-
-@bot.tree.command()
-async def referral_create(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    code = str(random.randint(10000000, 99999999))
-    con = db()
-    cur = con.cursor()
-    cur.execute("INSERT OR IGNORE INTO referrals VALUES (?,?)",
-                (interaction.user.id, code))
-    con.commit()
-    con.close()
-    await interaction.followup.send(f"🎁 Your referral code: `{code}`")
-
-@bot.tree.command()
-async def refer(interaction: discord.Interaction, code: str):
-    await interaction.response.defer(ephemeral=True)
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT 1 FROM referrals WHERE code=?", (code,))
-    if not cur.fetchone():
-        await interaction.followup.send("❌ Invalid code")
-        con.close()
+    if not games:
+        await interaction.response.send_message("❌ No games available.")
         return
-    cur.execute("INSERT OR IGNORE INTO referral_uses VALUES (?)",
-                (interaction.user.id,))
-    con.commit()
-    con.close()
-    await interaction.followup.send("✅ Referral redeemed (+1 daily gen)")
 
-@bot.tree.command()
-async def report(interaction: discord.Interaction, account: str, reason: str):
-    con = db()
-    cur = con.cursor()
-    cur.execute("INSERT INTO reports VALUES (?,?)", (account, reason))
-    con.commit()
-    con.close()
-    await interaction.response.send_message("⚠️ Report submitted", ephemeral=True)
+    pages = []
+    chunk = 15
+    for i in range(0, len(games), chunk):
+        pages.append(
+            "🎮 **Available Games**\n" +
+            "\n".join(games[i:i + chunk])
+        )
 
+    view = GameView(interaction.user.id, pages)
+    view.update()
+    await interaction.response.send_message(pages[0], view=view)
+
+@bot.tree.command(name="search", description="Search stock for a game")
+async def search(interaction: discord.Interaction, game: str):
+    with db() as con:
+        cur = con.cursor()
+        cur.execute(
+            "SELECT COUNT(*) FROM accounts WHERE used=0 AND games LIKE ?",
+            (f"%{game}%",)
+        )
+        count = cur.fetchone()[0]
+
+    await interaction.response.send_message(
+        f"🔍 **{game}** stock: **{count}**"
+    )
+
+@bot.tree.command(name="stock", description="View stock by game")
+async def stock(interaction: discord.Interaction):
+    with db() as con:
+        cur = con.cursor()
+        cur.execute("SELECT games FROM accounts WHERE used=0")
+        rows = cur.fetchall()
+
+    counts = {}
+    for (games,) in rows:
+        for g in games.split(","):
+            g = g.strip()
+            if g:
+                counts[g] = counts.get(g, 0) + 1
+
+    if not counts:
+        await interaction.response.send_message("❌ No stock.")
+        return
+
+    msg = "📦 **Stock by Game**\n"
+    msg += "\n".join(f"{g}: {c}" for g, c in sorted(counts.items()))
+    await interaction.response.send_message(msg)
+
+@bot.tree.command(name="mystats", description="View your stats")
+async def mystats(interaction: discord.Interaction):
+    used = used_today(interaction.user.id)
+    limit = daily_limit(interaction.user)
+    referral = has_referral(interaction.user.id)
+
+    await interaction.response.send_message(
+        f"📊 **Your Stats**\n"
+        f"Gens today: **{used}/{limit}**\n"
+        f"Referral bonus: **{'Yes' if referral else 'No'}**",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="topusers", description="Top users today")
+async def topusers(interaction: discord.Interaction):
+    with db() as con:
+        cur = con.cursor()
+        cur.execute(
+            "SELECT user_id, COUNT(*) FROM gens "
+            "WHERE day=? GROUP BY user_id ORDER BY COUNT(*) DESC LIMIT 10",
+            (date.today().isoformat(),)
+        )
+        rows = cur.fetchall()
+
+    if not rows:
+        await interaction.response.send_message("❌ No gens today.")
+        return
+
+    msg = "🏆 **Top Users Today**\n"
+    for i, (uid, count) in enumerate(rows, 1):
+        msg += f"{i}. <@{uid}> — {count}\n"
+
+    await interaction.response.send_message(msg)
+
+# ================= REFERRALS =================
+
+@bot.tree.command(name="referral_create", description="Create your referral code")
+async def referral_create(interaction: discord.Interaction):
+    code = "".join(str(random.randint(0, 9)) for _ in range(8))
+
+    with db() as con:
+        cur = con.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO referrals VALUES (?,?)",
+            (interaction.user.id, code)
+        )
+
+    await interaction.response.send_message(
+        f"🎁 **Your Referral Code:** `{code}`",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="refer", description="Redeem a referral code")
+async def refer(interaction: discord.Interaction, code: str):
+    if not code.isdigit() or len(code) != 8:
+        await interaction.response.send_message("❌ Invalid code.", ephemeral=True)
+        return
+
+    with db() as con:
+        cur = con.cursor()
+        cur.execute("SELECT owner_id FROM referrals WHERE code=?", (code,))
+        row = cur.fetchone()
+
+        if not row:
+            await interaction.response.send_message("❌ Code not found.", ephemeral=True)
+            return
+
+        cur.execute(
+            "INSERT OR IGNORE INTO referral_uses VALUES (?)",
+            (interaction.user.id,)
+        )
+
+    await interaction.response.send_message(
+        "✅ Referral redeemed! +1 daily gen.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="boostinfo", description="Boost perks info")
+async def boostinfo(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "💎 **Boost Perks**\n"
+        "No boost: 2/day\n"
+        "1 boost: 4/day\n"
+        "2 boosts: 6/day\n"
+        "+ Referral bonus",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="report", description="Report a bad account")
+async def report(interaction: discord.Interaction, account: str, reason: str = "Invalid"):
+    with db() as con:
+        con.execute(
+            "INSERT INTO reports VALUES (?,?)",
+            (account, reason)
+        )
+
+    await interaction.response.send_message(
+        "🚨 Report submitted.",
+        ephemeral=True
+    )
 # ================= STAFF COMMANDS =================
 
-@bot.tree.command()
-@app_commands.check(staff_only)
-async def bulkadd(interaction: discord.Interaction, file: discord.Attachment):
-    await interaction.response.defer(ephemeral=True)
-    data = (await file.read()).decode().splitlines()
-
-    con = db()
-    cur = con.cursor()
-    added = 0
-
-    for line in data:
-        try:
-            creds, games = line.split("|")
-            user, pw = creds.split(":")
-            cur.execute(
-                "INSERT INTO accounts (username,password,games) VALUES (?,?,?)",
-                (user, pw, games)
-            )
-            added += 1
-        except:
-            continue
-
-    con.commit()
-    con.close()
-    await interaction.followup.send(f"✅ Added {added} accounts")
-
-@bot.tree.command()
+@bot.tree.command(name="addaccount", description="Add account(s) from file")
 @app_commands.check(staff_only)
 async def addaccount(interaction: discord.Interaction, file: discord.Attachment):
     await interaction.response.defer(ephemeral=True)
-    data = (await file.read()).decode().strip()
 
     try:
-        creds, games = data.split("|")
-        user, pw = creds.split(":")
-        con = db()
+        text = (await file.read()).decode("utf-8", errors="ignore")
+    except Exception:
+        await interaction.followup.send("❌ Failed to read file.")
+        return
+
+    added = 0
+
+    with db() as con:
+        cur = con.cursor()
+        for line in text.splitlines():
+            parsed = parse_account_line(line)
+            if not parsed:
+                continue
+            user, pwd, games = parsed
+            cur.execute(
+                "INSERT INTO accounts (username,password,games) VALUES (?,?,?)",
+                (user, pwd, games)
+            )
+            added += 1
+            break  # add ONE account only
+
+    await interaction.followup.send(f"✅ Added **{added}** account.")
+
+@bot.tree.command(name="bulkadd", description="Bulk add accounts from file")
+@app_commands.check(staff_only)
+async def bulkadd(interaction: discord.Interaction, file: discord.Attachment):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        text = (await file.read()).decode("utf-8", errors="ignore")
+    except Exception:
+        await interaction.followup.send("❌ Failed to read file.")
+        return
+
+    added = skipped = 0
+
+    with db() as con:
+        cur = con.cursor()
+        for line in text.splitlines():
+            parsed = parse_account_line(line)
+            if not parsed:
+                skipped += 1
+                continue
+
+            user, pwd, games = parsed
+            try:
+                cur.execute(
+                    "INSERT INTO accounts (username,password,games) VALUES (?,?,?)",
+                    (user, pwd, games)
+                )
+                added += 1
+            except Exception:
+                skipped += 1
+
+    await interaction.followup.send(
+        f"📂 **Bulk Upload Complete**\n"
+        f"✅ Added: **{added}**\n"
+        f"❌ Skipped: **{skipped}**"
+    )
+
+@bot.tree.command(name="removeaccount", description="Remove an account")
+@app_commands.check(staff_only)
+async def removeaccount(interaction: discord.Interaction, account: str):
+    with db() as con:
+        cur = con.cursor()
+        cur.execute("DELETE FROM accounts WHERE username||':'||password=?", (account,))
+        removed = cur.rowcount
+
+    await interaction.response.send_message(
+        f"🗑️ Removed **{removed}** account(s).",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="accountinfo", description="View account info")
+@app_commands.check(staff_only)
+async def accountinfo(interaction: discord.Interaction, account: str):
+    with db() as con:
         cur = con.cursor()
         cur.execute(
-            "INSERT INTO accounts (username,password,games) VALUES (?,?,?)",
-            (user, pw, games)
+            "SELECT games, used FROM accounts WHERE username||':'||password=?",
+            (account,)
         )
-        con.commit()
-        con.close()
-        await interaction.followup.send("✅ Account added")
-    except:
-        await interaction.followup.send("❌ Invalid format")
+        row = cur.fetchone()
 
-# ================= START =================
+    if not row:
+        await interaction.response.send_message("❌ Account not found.", ephemeral=True)
+        return
+
+    games, used = row
+    await interaction.response.send_message(
+        f"ℹ️ **Account Info**\n"
+        f"Games: `{games}`\n"
+        f"Used: `{bool(used)}`",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="reportedaccounts", description="View reported accounts")
+@app_commands.check(staff_only)
+async def reportedaccounts(interaction: discord.Interaction):
+    with db() as con:
+        cur = con.cursor()
+        cur.execute("SELECT account, reason FROM reports")
+        rows = cur.fetchall()
+
+    if not rows:
+        await interaction.response.send_message("✅ No reports.")
+        return
+
+    msg = "🚨 **Reported Accounts**\n"
+    for acc, reason in rows:
+        msg += f"`{acc}` — {reason}\n"
+
+    await interaction.response.send_message(msg)
+
+@bot.tree.command(name="resetreport", description="Clear report for account")
+@app_commands.check(staff_only)
+async def resetreport(interaction: discord.Interaction, account: str):
+    with db() as con:
+        cur = con.cursor()
+        cur.execute("DELETE FROM reports WHERE account=?", (account,))
+
+    await interaction.response.send_message(
+        "✅ Report cleared.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="resetallreports", description="Clear all reports")
+@app_commands.check(staff_only)
+async def resetallreports(interaction: discord.Interaction):
+    with db() as con:
+        con.execute("DELETE FROM reports")
+
+    await interaction.response.send_message(
+        "✅ All reports cleared.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="globalstats", description="View bot stats")
+@app_commands.check(staff_only)
+async def globalstats(interaction: discord.Interaction):
+    with db() as con:
+        cur = con.cursor()
+        cur.execute("SELECT COUNT(*) FROM accounts")
+        total = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM accounts WHERE used=0")
+        available = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM gens")
+        gens = cur.fetchone()[0]
+
+    await interaction.response.send_message(
+        f"🌍 **Global Stats**\n"
+        f"Total accounts: **{total}**\n"
+        f"Available: **{available}**\n"
+        f"Total gens: **{gens}**",
+        ephemeral=True
+    )
+
+# ================= START BOT =================
 bot.run(TOKEN)
