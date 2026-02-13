@@ -400,3 +400,25 @@ async def help_cmd(interaction: discord.Interaction):
 
 # ================= START =================
 bot.run(TOKEN)
+
+# ---- START WEB SERVER FOR RAILWAY ----
+import threading
+from flask import Flask, send_from_directory
+import os
+
+app = Flask(__name__, static_folder=".")
+
+@app.route("/")
+def home():
+    return send_from_directory(".", "index.html")
+
+@app.route("/health")
+def health():
+    return "OK"
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
+threading.Thread(target=run_web, daemon=True).start()
+# -------------------------------------
