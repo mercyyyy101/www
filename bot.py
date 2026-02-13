@@ -403,27 +403,35 @@ async def addaccount(interaction: discord.Interaction, file: discord.Attachment)
 
     try:
         text = (await file.read()).decode("utf-8", errors="ignore")
-    except Exception:
-        await interaction.followup.send("❌ Failed to read file.")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to read file: {e}")
         return
 
     added = 0
+    skipped = 0
 
     with db() as con:
         cur = con.cursor()
         for line in text.splitlines():
             parsed = parse_account_line(line)
             if not parsed:
+                skipped += 1
                 continue
             user, pwd, games = parsed
-            cur.execute(
-                "INSERT INTO accounts (username,password,games) VALUES (?,?,?)",
-                (user, pwd, games)
-            )
-            added += 1
-            break  # add ONE account only
+            try:
+                cur.execute(
+                    "INSERT INTO accounts (username,password,games) VALUES (?,?,?)",
+                    (user, pwd, games)
+                )
+                added += 1
+            except Exception:
+                skipped += 1
+        con.commit()
 
-    await interaction.followup.send(f"✅ Added **{added}** account.")
+    await interaction.followup.send(
+        f"✅ Added **{added}** account(s).\n"
+        f"⚠️ Skipped **{skipped}** line(s)."
+    )
 
 @bot.tree.command(name="bulkadd", description="Bulk add accounts from file")
 @app_commands.check(staff_only)
@@ -432,11 +440,12 @@ async def bulkadd(interaction: discord.Interaction, file: discord.Attachment):
 
     try:
         text = (await file.read()).decode("utf-8", errors="ignore")
-    except Exception:
-        await interaction.followup.send("❌ Failed to read file.")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to read file: {e}")
         return
 
-    added = skipped = 0
+    added = 0
+    skipped = 0
 
     with db() as con:
         cur = con.cursor()
@@ -455,6 +464,7 @@ async def bulkadd(interaction: discord.Interaction, file: discord.Attachment):
                 added += 1
             except Exception:
                 skipped += 1
+        con.commit()
 
     await interaction.followup.send(
         f"📂 **Bulk Upload Complete**\n"
