@@ -200,11 +200,13 @@ class GameView(discord.ui.View):
 
 @bot.tree.command(name="steamaccount", description="Generate a Steam account for a game")
 async def steamaccount(interaction: discord.Interaction, game: str):
+    await interaction.response.defer(ephemeral=True)
+    
     used = used_today(interaction.user.id)
     limit = daily_limit(interaction.user)
 
     if used >= limit:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"❌ Daily limit reached ({limit}/day).",
             ephemeral=True
         )
@@ -213,31 +215,61 @@ async def steamaccount(interaction: discord.Interaction, game: str):
     with db() as con:
         cur = con.cursor()
         cur.execute(
-            "SELECT id, username, password FROM accounts "
+            "SELECT id, username, password, games FROM accounts "
             "WHERE used=0 AND games LIKE ? ORDER BY RANDOM() LIMIT 1",
             (f"%{game}%",)
         )
         row = cur.fetchone()
 
         if not row:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ No accounts available for that game.",
                 ephemeral=True
             )
             return
 
-        acc_id, user, pwd = row
+        acc_id, user, pwd, games = row
         cur.execute("UPDATE accounts SET used=1 WHERE id=?", (acc_id,))
         cur.execute(
             "INSERT INTO gens VALUES (?,?)",
             (interaction.user.id, date.today().isoformat())
         )
 
-    await interaction.response.send_message(
-        f"🎮 **Steam Account Generated**\n"
-        f"**Login:** `{user}:{pwd}`",
-        ephemeral=True
+    # Create embed for DM
+    embed = discord.Embed(
+        title="🎮 Generated Steam Account",
+        description="Silent gen has agreed to only distribute accounts they own. Silent Gen takes no responsibility for what you do with these accounts.",
+        color=discord.Color.blue()
     )
+    
+    embed.add_field(
+        name="🔐 Account Details",
+        value=f"`{user}:{pwd}`",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🎮 Games",
+        value=games if len(games) < 1024 else games[:1021] + "...",
+        inline=False
+    )
+    
+    embed.set_footer(text=f"Enjoy! ❤️")
+    
+    # Try to send DM
+    try:
+        await interaction.user.send(embed=embed)
+        await interaction.followup.send(
+            "✅ Account sent to your DMs!",
+            ephemeral=True
+        )
+    except discord.Forbidden:
+        # If DM fails, send ephemeral message
+        await interaction.followup.send(
+            f"❌ Couldn't send DM. Please enable DMs from server members.\n\n"
+            f"**Account:** `{user}:{pwd}`",
+            ephemeral=True
+        )
 
 @bot.tree.command(name="listgames", description="View available games")
 async def listgames(interaction: discord.Interaction):
