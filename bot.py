@@ -319,7 +319,6 @@ async def search(interaction: discord.Interaction, game: str):
     )
 
 @bot.tree.command(name="stock", description="View stock by game")
-@bot.tree.command(name="stock", description="View stock by game")
 async def stock(interaction: discord.Interaction):
     with db() as con:
         cur = con.cursor()
