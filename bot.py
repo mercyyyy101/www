@@ -319,6 +319,7 @@ async def search(interaction: discord.Interaction, game: str):
     )
 
 @bot.tree.command(name="stock", description="View stock by game")
+@bot.tree.command(name="stock", description="View stock by game")
 async def stock(interaction: discord.Interaction):
     with db() as con:
         cur = con.cursor()
@@ -333,12 +334,25 @@ async def stock(interaction: discord.Interaction):
                 counts[g] = counts.get(g, 0) + 1
 
     if not counts:
-        await interaction.response.send_message("❌ No stock.")
+        await interaction.response.send_message("❌ No stock.", ephemeral=True)
         return
 
-    msg = "📦 **Stock by Game**\n"
-    msg += "\n".join(f"{g}: {c}" for g, c in sorted(counts.items()))
-    await interaction.response.send_message(msg)
+    # Create embed for better formatting
+    embed = discord.Embed(
+        title="📦 Stock by Game",
+        color=discord.Color.blue()
+    )
+    
+    # Split into chunks if too many games
+    items = sorted(counts.items())
+    stock_text = "\n".join(f"**{g}:** {c}" for g, c in items[:25])  # First 25 games
+    
+    embed.description = stock_text
+    
+    if len(items) > 25:
+        embed.set_footer(text=f"Showing 25 of {len(items)} games")
+    
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="mystats", description="View your stats")
 async def mystats(interaction: discord.Interaction):
