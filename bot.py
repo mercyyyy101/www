@@ -155,7 +155,15 @@ def parse_account_line(line: str):
 async def on_ready():
     init_db()
     await bot.tree.sync()
+    
+    # Set custom status - "Playing" with Steam accounts
+    await bot.change_presence(
+        activity=discord.Game(name="🎮 Generating Steam accounts"),
+        status=discord.Status.online
+    )
+    
     print(f"✅ Logged in as {bot.user}")
+    print(f"🎮 Status set: Playing 🎮 Generating Steam accounts")
 
 # ================= PAGINATION VIEW =================
 class GameView(discord.ui.View):
