@@ -328,20 +328,30 @@ async def search(interaction: discord.Interaction, game: str):
 
 @bot.tree.command(name="stock", description="View stock by game")
 async def stock(interaction: discord.Interaction):
+    await interaction.response.defer()
+    
     with db() as con:
         cur = con.cursor()
         cur.execute("SELECT games FROM accounts WHERE used=0")
         rows = cur.fetchall()
 
     counts = {}
-    for (games,) in rows:
-        for g in games.split(","):
-            g = g.strip()
-            if g:
-                counts[g] = counts.get(g, 0) + 1
+    for (games_str,) in rows:
+        if not games_str or games_str == "Unknown":
+            continue
+            
+        # Split by comma and clean each game name
+        game_list = games_str.split(",")
+        for game in game_list:
+            game = game.strip()
+            # Remove any extra formatting
+            game = game.replace("GAMES:", "").replace("Games:", "").replace("games:", "").strip()
+            
+            if game and game != "Unknown":
+                counts[game] = counts.get(game, 0) + 1
 
     if not counts:
-        await interaction.response.send_message("❌ No stock.", ephemeral=True)
+        await interaction.followup.send("❌ No stock available.", ephemeral=True)
         return
 
     # Create embed for better formatting
@@ -350,16 +360,62 @@ async def stock(interaction: discord.Interaction):
         color=discord.Color.blue()
     )
     
+    # Sort by count (descending) then alphabetically
+    items = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+    
     # Split into chunks if too many games
-    items = sorted(counts.items())
-    stock_text = "\n".join(f"**{g}:** {c}" for g, c in items[:25])  # First 25 games
+    stock_text = "\n".join(f"**{g}:** `{c}` available" for g, c in items[:25])
     
     embed.description = stock_text
     
     if len(items) > 25:
-        embed.set_footer(text=f"Showing 25 of {len(items)} games")
+        embed.set_footer(text=f"Showing top 25 of {len(items)} games • Total: {sum(counts.values())} accounts")
+    else:
+        embed.set_footer(text=f"Total: {sum(counts.values())} accounts")
     
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="restock", description="Mark all accounts as unused (restock)")
+@app_commands.check(staff_only)
+async def restock(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    
+    with db() as con:
+        cur = con.cursor()
+        
+        # Count how many will be restocked
+        cur.execute("SELECT COUNT(*) FROM accounts WHERE used=1")
+        count = cur.fetchone()[0]
+        
+        if count == 0:
+            await interaction.followup.send("ℹ️ No accounts to restock (all are already available).", ephemeral=True)
+            return
+        
+        # Reset all accounts to unused
+        cur.execute("UPDATE accounts SET used=0")
+        
+        # Clear generation history
+        cur.execute("DELETE FROM gens")
+        
+        con.commit()
+    
+    embed = discord.Embed(
+        title="🔄 Accounts Restocked",
+        description=f"Successfully restocked **{count}** account(s)!",
+        color=discord.Color.green()
+    )
+    
+    embed.add_field(
+        name="What was done:",
+        value=(
+            "✅ All accounts marked as unused\n"
+            "✅ Generation history cleared\n"
+            "✅ Everyone can generate again"
+        ),
+        inline=False
+    )
+    
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="mystats", description="View your stats")
 async def mystats(interaction: discord.Interaction):
