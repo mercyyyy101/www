@@ -658,3 +658,4 @@ async def globalstats(interaction: discord.Interaction):
 
 # ================= START BOT =================
 bot.run(TOKEN)
+
