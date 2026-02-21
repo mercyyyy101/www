@@ -17,6 +17,8 @@ MEMBER_ROLE_ID = 1471512804535046237
 BOOSTER_ROLE_ID = 1469733875709378674
 BOOSTER_ROLE_2_ID = 1471590464279810210
 STAFF_ROLE_ID = 1471515890225774663
+STAFF_ROLE_2_ID = 1474815528538472538
+STAFF_ROLE_3_ID = 1471918887934361690
 # =========================================
 
 intents = discord.Intents.default()
@@ -96,7 +98,7 @@ def has_referral(user_id):
         return cur.fetchone() is not None
 
 def daily_limit(member):
-    if has_role(member, STAFF_ROLE_ID):
+    if any(has_role(member, r) for r in (STAFF_ROLE_ID, STAFF_ROLE_2_ID, STAFF_ROLE_3_ID)):
         return 999
     limit = base_limit(member)
     if has_referral(member.id):
@@ -113,7 +115,14 @@ def used_today(user_id):
         return cur.fetchone()[0]
 
 def staff_only(interaction: discord.Interaction):
-    return has_role(interaction.user, STAFF_ROLE_ID)
+    return any(has_role(interaction.user, r) for r in (STAFF_ROLE_ID, STAFF_ROLE_2_ID, STAFF_ROLE_3_ID))
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"❌ An error occurred: {error}", ephemeral=True)
 
 # ================= FILE PARSER =================
 def is_credential_line(line: str) -> bool:
@@ -540,6 +549,10 @@ async def vouch(interaction: discord.Interaction, message: str):
 @app_commands.check(staff_only)
 async def restock(interaction: discord.Interaction, file: discord.Attachment):
     await interaction.response.defer(ephemeral=True)
+
+    if not staff_only(interaction):
+        await interaction.followup.send("❌ You don't have permission to use this command.", ephemeral=True)
+        return
 
     try:
         text = (await file.read()).decode("utf-8", errors="ignore")
