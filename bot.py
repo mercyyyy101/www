@@ -113,35 +113,99 @@ def staff_only(interaction: discord.Interaction):
     return has_role(interaction.user, STAFF_ROLE_ID)
 
 # ================= FILE PARSER =================
-def parse_account_line(line: str):
-    """
-    Supports: user:pass – Game Name
-    Returns (username, password, games) or None if invalid
-    """
+def is_credential_line(line: str) -> bool:
+    """Check if a line looks like user:pass credentials."""
     line = line.strip()
-    if not line:
-        return None
+    if ":" not in line:
+        return False
+    user, pwd = line.split(":", 1)
+    user = user.strip()
+    pwd = pwd.strip()
+    # Must have a non-empty username, password can be empty but username can't
+    # Also username shouldn't contain spaces (game titles do)
+    if not user or " " in user:
+        return False
+    return True
 
-    # Normalise all dash variants to a pipe
-    line = line.replace(" \u2013 ", "|").replace(" \u2014 ", "|").replace(" - ", "|").replace(" | ", "|")
-    line = line.replace("GAMES:", "").replace("Games:", "").replace("games:", "").strip()
+def parse_file(text: str):
+    """
+    Parses two formats:
+      Format 1 (inline):  user:pass – Game Name
+      Format 2 (block):   Game1\nGame2\nuser:pass\npassword_on_next_line
+    Returns list of (username, password, games)
+    """
+    results = []
+    lines = [l.rstrip() for l in text.splitlines()]
+    i = 0
 
-    if ":" not in line or "|" not in line:
-        return None
+    while i < len(lines):
+        line = lines[i].strip()
 
-    parts = line.split("|", 1)
-    creds = parts[0].strip()
+        if not line:
+            i += 1
+            continue
 
-    if ":" not in creds:
-        return None
+        # Check for inline format: user:pass – Game or user:pass | Game
+        normalised = line.replace(" \u2013 ", "|").replace(" \u2014 ", "|").replace(" - ", "|").replace(" | ", "|")
+        normalised = normalised.replace("GAMES:", "").replace("Games:", "").replace("games:", "").strip()
 
-    user, pwd = creds.split(":", 1)
-    games = parts[1].strip() if len(parts) > 1 else "Unknown"
+        if "|" in normalised and ":" in normalised.split("|")[0]:
+            parts = normalised.split("|", 1)
+            creds = parts[0].strip()
+            games = parts[1].strip()
+            if ":" in creds and games:
+                user, pwd = creds.split(":", 1)
+                if user.strip() and pwd.strip():
+                    results.append((user.strip(), pwd.strip(), games.strip()))
+                    i += 1
+                    continue
 
-    if not user.strip() or not pwd.strip() or not games or games == "Unknown":
-        return None
+        # Check for block format: game lines followed by credential line(s)
+        # Collect consecutive non-empty lines, find where credentials start
+        block_start = i
+        block_lines = []
+        while i < len(lines) and lines[i].strip():
+            block_lines.append(lines[i].strip())
+            i += 1
 
-    return user.strip(), pwd.strip(), games.strip()
+        if not block_lines:
+            i += 1
+            continue
+
+        # Find the credential line in the block (first line with ":" and no spaces in username)
+        cred_index = None
+        for j, bl in enumerate(block_lines):
+            if is_credential_line(bl):
+                cred_index = j
+                break
+
+        if cred_index is None:
+            # No credentials found in this block, skip
+            continue
+
+        # Games are everything before the credential line
+        game_lines = [bl for bl in block_lines[:cred_index] if bl]
+        cred_line = block_lines[cred_index]
+
+        # Password might be on the next line if cred line ends with ":"
+        user, pwd = cred_line.split(":", 1)
+        user = user.strip()
+        pwd = pwd.strip()
+
+        # If password is empty, check if next block line has it
+        if not pwd and cred_index + 1 < len(block_lines):
+            pwd = block_lines[cred_index + 1].strip()
+
+        if not user or not pwd:
+            continue
+
+        games = ", ".join(game_lines) if game_lines else "Unknown"
+        if games == "Unknown":
+            continue
+
+        results.append((user, pwd, games))
+
+    return results
 
 # ================= EVENTS =================
 @bot.event
@@ -197,34 +261,7 @@ class GameView(discord.ui.View):
         self.next.disabled = self.index == len(self.pages) - 1
 
 
-class StockView(discord.ui.View):
-    def __init__(self, user_id, pages):
-        super().__init__(timeout=120)
-        self.user_id = user_id
-        self.pages = pages
-        self.index = 0
 
-    async def interaction_check(self, interaction: discord.Interaction):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ Not your menu.", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
-    async def prev(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.index -= 1
-        self.update_buttons()
-        await interaction.response.edit_message(embed=self.pages[self.index], view=self)
-
-    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
-    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.index += 1
-        self.update_buttons()
-        await interaction.response.edit_message(embed=self.pages[self.index], view=self)
-
-    def update_buttons(self):
-        self.prev.disabled = self.index == 0
-        self.next.disabled = self.index == len(self.pages) - 1
 
 # ================= USER COMMANDS =================
 
@@ -347,49 +384,22 @@ async def search(interaction: discord.Interaction, game: str):
     )
 
 
-@bot.tree.command(name="stock", description="View stock by game")
+@bot.tree.command(name="stock", description="View total available accounts")
 async def stock(interaction: discord.Interaction):
     await interaction.response.defer()
 
     with db() as con:
         cur = con.cursor()
-        cur.execute("SELECT games FROM accounts WHERE used=0")
-        rows = cur.fetchall()
+        cur.execute("SELECT COUNT(*) FROM accounts")
+        total = cur.fetchone()[0]
 
-    counts = {}
-    for (games_str,) in rows:
-        if not games_str or games_str.strip().lower() == "unknown":
-            continue
-        for game in games_str.split(","):
-            game = game.strip()
-            if game:
-                counts[game] = counts.get(game, 0) + 1
+    embed = discord.Embed(
+        title="📦 Stock",
+        description=f"**{total}** account(s) available",
+        color=discord.Color.blue()
+    )
 
-    if not counts:
-        await interaction.followup.send("❌ No stock available.", ephemeral=True)
-        return
-
-    items = sorted(counts.items(), key=lambda x: (-x[1], x[0].lower()))
-
-    chunk_size = 20
-    pages = []
-    for i in range(0, len(items), chunk_size):
-        chunk = items[i:i + chunk_size]
-        embed = discord.Embed(title="📦 Stock by Game", color=discord.Color.blue())
-        embed.description = "\n".join(f"**{g}:** `{c}` available" for g, c in chunk)
-        total_shown = i + len(chunk)
-        embed.set_footer(
-            text=f"Showing {i+1}–{total_shown} of {len(items)} games • "
-                 f"Total accounts: {sum(counts.values())}"
-        )
-        pages.append(embed)
-
-    if len(pages) == 1:
-        await interaction.followup.send(embed=pages[0])
-    else:
-        view = StockView(interaction.user.id, pages)
-        view.update_buttons()
-        await interaction.followup.send(embed=pages[0], view=view)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="mystats", description="View your stats")
@@ -510,20 +520,13 @@ async def restock(interaction: discord.Interaction, file: discord.Attachment):
         await interaction.followup.send(f"❌ Failed to read file: {e}", ephemeral=True)
         return
 
+    parsed_accounts = parse_file(text)
     added = 0
-    skipped = 0
     game_counts = {}
 
     with db() as con:
         cur = con.cursor()
-        for line in text.splitlines():
-            parsed = parse_account_line(line)
-            if not parsed:
-                if line.strip():
-                    skipped += 1
-                continue
-
-            user, pwd, games = parsed
+        for user, pwd, games in parsed_accounts:
             try:
                 cur.execute(
                     "INSERT INTO accounts (username, password, games, used) VALUES (?, ?, ?, 0)",
@@ -532,7 +535,7 @@ async def restock(interaction: discord.Interaction, file: discord.Attachment):
                 added += 1
                 game_counts[games] = game_counts.get(games, 0) + 1
             except Exception:
-                skipped += 1
+                pass
         con.commit()
 
     if added == 0:
@@ -549,7 +552,7 @@ async def restock(interaction: discord.Interaction, file: discord.Attachment):
         for game, count in sorted(game_counts.items(), key=lambda x: x[0].lower())
     )
     embed.add_field(name="📦 Games Added", value=stock_lines or "None", inline=False)
-    embed.set_footer(text=f"✅ {added} account(s) added • ❌ {skipped} skipped")
+    embed.set_footer(text=f"✅ {added} account(s) added")
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -658,4 +661,3 @@ async def globalstats(interaction: discord.Interaction):
 
 # ================= START BOT =================
 bot.run(TOKEN)
-
