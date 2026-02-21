@@ -64,8 +64,11 @@ def init_db():
         """)
 
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS referral_uses (
-            user_id INTEGER UNIQUE
+        CREATE TABLE IF NOT EXISTS vouches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            message TEXT,
+            timestamp TEXT
         )
         """)
 
@@ -283,7 +286,7 @@ async def steamaccount(interaction: discord.Interaction, game: str):
         cur = con.cursor()
         cur.execute(
             "SELECT id, username, password, games FROM accounts "
-            "WHERE used=0 AND games LIKE ? ORDER BY RANDOM() LIMIT 1",
+            "WHERE games LIKE ? ORDER BY RANDOM() LIMIT 1",
             (f"%{game}%",)
         )
         row = cur.fetchone()
@@ -296,7 +299,6 @@ async def steamaccount(interaction: discord.Interaction, game: str):
             return
 
         acc_id, user, pwd, games = row
-        cur.execute("UPDATE accounts SET used=1 WHERE id=?", (acc_id,))
         cur.execute(
             "INSERT INTO gens VALUES (?,?)",
             (interaction.user.id, date.today().isoformat())
@@ -342,7 +344,7 @@ async def steamaccount(interaction: discord.Interaction, game: str):
 async def listgames(interaction: discord.Interaction):
     with db() as con:
         cur = con.cursor()
-        cur.execute("SELECT DISTINCT games FROM accounts WHERE used=0")
+        cur.execute("SELECT DISTINCT games FROM accounts")
         rows = cur.fetchall()
 
     games = sorted({
@@ -374,7 +376,7 @@ async def search(interaction: discord.Interaction, game: str):
     with db() as con:
         cur = con.cursor()
         cur.execute(
-            "SELECT COUNT(*) FROM accounts WHERE used=0 AND games LIKE ?",
+            "SELECT COUNT(*) FROM accounts WHERE games LIKE ?",
             (f"%{game}%",)
         )
         count = cur.fetchone()[0]
@@ -392,12 +394,14 @@ async def stock(interaction: discord.Interaction):
         cur = con.cursor()
         cur.execute("SELECT COUNT(*) FROM accounts")
         total = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM reports")
+        reported = cur.fetchone()[0]
 
-    embed = discord.Embed(
-        title="📦 Stock",
-        description=f"**{total}** account(s) available",
-        color=discord.Color.blue()
-    )
+    available = total - reported
+
+    embed = discord.Embed(title="📦 Stock", color=discord.Color.blue())
+    embed.add_field(name="✅ Available", value=f"**{available}** account(s)", inline=False)
+    embed.add_field(name="🚨 Reported", value=f"**{reported}** account(s)", inline=False)
 
     await interaction.followup.send(embed=embed)
 
@@ -506,6 +510,29 @@ async def report(interaction: discord.Interaction, account: str, reason: str = "
         "🚨 Report submitted.",
         ephemeral=True
     )
+
+
+@bot.tree.command(name="vouch", description="Leave a vouch for the service")
+async def vouch(interaction: discord.Interaction, message: str):
+    from datetime import datetime
+    timestamp = datetime.utcnow().isoformat()
+
+    with db() as con:
+        cur = con.cursor()
+        cur.execute(
+            "INSERT INTO vouches (user_id, message, timestamp) VALUES (?, ?, ?)",
+            (interaction.user.id, message, timestamp)
+        )
+
+    embed = discord.Embed(
+        title="⭐ New Vouch",
+        description=message,
+        color=discord.Color.gold()
+    )
+    embed.set_footer(text=f"Vouched by {interaction.user.display_name}")
+    embed.timestamp = discord.utils.utcnow()
+
+    await interaction.response.send_message(embed=embed)
 
 # ================= STAFF COMMANDS =================
 
