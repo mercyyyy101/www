@@ -65,14 +65,7 @@ def init_db():
         )
         """)
 
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS vouches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            message TEXT,
-            timestamp TEXT
-        )
-        """)
+
 
 # ================= HELPERS =================
 def has_role(member, role_id):
@@ -521,27 +514,6 @@ async def report(interaction: discord.Interaction, account: str, reason: str = "
     )
 
 
-@bot.tree.command(name="vouch", description="Leave a vouch for the service")
-async def vouch(interaction: discord.Interaction, message: str):
-    from datetime import datetime
-    timestamp = datetime.utcnow().isoformat()
-
-    with db() as con:
-        cur = con.cursor()
-        cur.execute(
-            "INSERT INTO vouches (user_id, message, timestamp) VALUES (?, ?, ?)",
-            (interaction.user.id, message, timestamp)
-        )
-
-    embed = discord.Embed(
-        title="⭐ New Vouch",
-        description=message,
-        color=discord.Color.gold()
-    )
-    embed.set_footer(text=f"Vouched by {interaction.user.display_name}")
-    embed.timestamp = discord.utils.utcnow()
-
-    await interaction.response.send_message(embed=embed)
 
 # ================= STAFF COMMANDS =================
 
