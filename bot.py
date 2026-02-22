@@ -1,4 +1,5 @@
 import os
+import json
 import sqlite3
 import random
 from datetime import date
@@ -12,6 +13,7 @@ if not TOKEN:
     raise RuntimeError("DISCORD TOKEN MISSING")
 
 DB_PATH = "steam_bot.db"
+STOCK_PATH = "stock.json"
 
 MEMBER_ROLE_ID = 1471512804535046237
 BOOSTER_ROLE_ID = 1469733875709378674
@@ -26,23 +28,41 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ================= DATABASE =================
+# ================= STOCK JSON =================
+def load_stock() -> list:
+    if not os.path.exists(STOCK_PATH):
+        return []
+    with open(STOCK_PATH, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return []
+
+def save_stock(stock: list):
+    with open(STOCK_PATH, "w", encoding="utf-8") as f:
+        json.dump(stock, f, indent=2, ensure_ascii=False)
+
+def add_accounts_to_stock(accounts: list):
+    """accounts is a list of {"username": ..., "password": ..., "games": ...}"""
+    stock = load_stock()
+    existing = {f"{a['username']}:{a['password']}" for a in stock}
+    added = 0
+    for acc in accounts:
+        key = f"{acc['username']}:{acc['password']}"
+        if key not in existing:
+            stock.append(acc)
+            existing.add(key)
+            added += 1
+    save_stock(stock)
+    return added
+
+# ================= DATABASE (gens/reports/referrals only) =================
 def db():
     return sqlite3.connect(DB_PATH)
 
 def init_db():
     with db() as con:
         cur = con.cursor()
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS accounts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT,
-            password TEXT,
-            games TEXT,
-            used INTEGER DEFAULT 0
-        )
-        """)
 
         cur.execute("""
         CREATE TABLE IF NOT EXISTS gens (
@@ -65,7 +85,11 @@ def init_db():
         )
         """)
 
-
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS referral_uses (
+            user_id INTEGER UNIQUE
+        )
+        """)
 
 # ================= HELPERS =================
 def has_role(member, role_id):
@@ -77,7 +101,6 @@ def base_limit(member):
         boosts += 1
     if has_role(member, BOOSTER_ROLE_2_ID):
         boosts += 1
-
     if boosts == 1:
         return 4
     if boosts >= 2:
@@ -115,28 +138,27 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     if isinstance(error, app_commands.CheckFailure):
         await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
     else:
-        await interaction.response.send_message(f"❌ An error occurred: {error}", ephemeral=True)
+        try:
+            await interaction.response.send_message(f"❌ An error occurred: {error}", ephemeral=True)
+        except Exception:
+            await interaction.followup.send(f"❌ An error occurred: {error}", ephemeral=True)
 
 # ================= FILE PARSER =================
 def is_credential_line(line: str) -> bool:
-    """Check if a line looks like user:pass credentials."""
     line = line.strip()
     if ":" not in line:
         return False
-    user, pwd = line.split(":", 1)
+    user, _ = line.split(":", 1)
     user = user.strip()
-    pwd = pwd.strip()
-    # Must have a non-empty username, password can be empty but username can't
-    # Also username shouldn't contain spaces (game titles do)
     if not user or " " in user:
         return False
     return True
 
 def parse_file(text: str):
     """
-    Parses two formats:
+    Supports:
       Format 1 (inline):  user:pass – Game Name
-      Format 2 (block):   Game1\nGame2\nuser:pass\npassword_on_next_line
+      Format 2 (block):   Game1\nGame2\nuser:pass
     Returns list of (username, password, games)
     """
     results = []
@@ -150,7 +172,7 @@ def parse_file(text: str):
             i += 1
             continue
 
-        # Check for inline format: user:pass – Game or user:pass | Game
+        # Inline format
         normalised = line.replace(" \u2013 ", "|").replace(" \u2014 ", "|").replace(" - ", "|").replace(" | ", "|")
         normalised = normalised.replace("GAMES:", "").replace("Games:", "").replace("games:", "").strip()
 
@@ -165,9 +187,7 @@ def parse_file(text: str):
                     i += 1
                     continue
 
-        # Check for block format: game lines followed by credential line(s)
-        # Collect consecutive non-empty lines, find where credentials start
-        block_start = i
+        # Block format
         block_lines = []
         while i < len(lines) and lines[i].strip():
             block_lines.append(lines[i].strip())
@@ -177,7 +197,6 @@ def parse_file(text: str):
             i += 1
             continue
 
-        # Find the credential line in the block (first line with ":" and no spaces in username)
         cred_index = None
         for j, bl in enumerate(block_lines):
             if is_credential_line(bl):
@@ -185,27 +204,23 @@ def parse_file(text: str):
                 break
 
         if cred_index is None:
-            # No credentials found in this block, skip
             continue
 
-        # Games are everything before the credential line
         game_lines = [bl for bl in block_lines[:cred_index] if bl]
         cred_line = block_lines[cred_index]
 
-        # Password might be on the next line if cred line ends with ":"
         user, pwd = cred_line.split(":", 1)
         user = user.strip()
         pwd = pwd.strip()
 
-        # If password is empty, check if next block line has it
         if not pwd and cred_index + 1 < len(block_lines):
             pwd = block_lines[cred_index + 1].strip()
 
         if not user or not pwd:
             continue
 
-        games = ", ".join(game_lines) if game_lines else "Unknown"
-        if games == "Unknown":
+        games = ", ".join(game_lines) if game_lines else None
+        if not games:
             continue
 
         results.append((user, pwd, games))
@@ -217,16 +232,13 @@ def parse_file(text: str):
 async def on_ready():
     init_db()
     await bot.tree.sync()
-
     await bot.change_presence(
         activity=discord.Game(name="🎮 Generating Steam accounts"),
         status=discord.Status.online
     )
-
     print(f"✅ Logged in as {bot.user}")
-    print(f"🎮 Status set: Playing 🎮 Generating Steam accounts")
 
-# ================= PAGINATION VIEWS =================
+# ================= PAGINATION VIEW =================
 class GameView(discord.ui.View):
     def __init__(self, user_id, pages):
         super().__init__(timeout=120)
@@ -236,10 +248,7 @@ class GameView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
-            await interaction.response.send_message(
-                "❌ These buttons are not for you.",
-                ephemeral=True
-            )
+            await interaction.response.send_message("❌ These buttons are not for you.", ephemeral=True)
             return False
         return True
 
@@ -247,26 +256,17 @@ class GameView(discord.ui.View):
     async def prev(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.index -= 1
         self.update()
-        await interaction.response.edit_message(
-            content=self.pages[self.index],
-            view=self
-        )
+        await interaction.response.edit_message(content=self.pages[self.index], view=self)
 
     @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
     async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.index += 1
         self.update()
-        await interaction.response.edit_message(
-            content=self.pages[self.index],
-            view=self
-        )
+        await interaction.response.edit_message(content=self.pages[self.index], view=self)
 
     def update(self):
         self.prev.disabled = self.index == 0
         self.next.disabled = self.index == len(self.pages) - 1
-
-
-
 
 # ================= USER COMMANDS =================
 
@@ -278,81 +278,49 @@ async def steamaccount(interaction: discord.Interaction, game: str):
     limit = daily_limit(interaction.user)
 
     if used >= limit:
-        await interaction.followup.send(
-            f"❌ Daily limit reached ({limit}/day).",
-            ephemeral=True
-        )
+        await interaction.followup.send(f"❌ Daily limit reached ({limit}/day).", ephemeral=True)
         return
 
+    stock = load_stock()
+    matches = [a for a in stock if game.lower() in a["games"].lower()]
+
+    if not matches:
+        await interaction.followup.send("❌ No accounts available for that game.", ephemeral=True)
+        return
+
+    acc = random.choice(matches)
+    user, pwd, games = acc["username"], acc["password"], acc["games"]
+
     with db() as con:
-        cur = con.cursor()
-        cur.execute(
-            "SELECT id, username, password, games FROM accounts "
-            "WHERE games LIKE ? ORDER BY RANDOM() LIMIT 1",
-            (f"%{game}%",)
-        )
-        row = cur.fetchone()
-
-        if not row:
-            await interaction.followup.send(
-                "❌ No accounts available for that game.",
-                ephemeral=True
-            )
-            return
-
-        acc_id, user, pwd, games = row
-        cur.execute(
-            "INSERT INTO gens VALUES (?,?)",
-            (interaction.user.id, date.today().isoformat())
-        )
+        con.execute("INSERT INTO gens VALUES (?,?)", (interaction.user.id, date.today().isoformat()))
 
     embed = discord.Embed(
         title="🎮 Generated Steam Account",
-        description="Crimson gen has agreed to only distribute accounts they own. Crimson Gen takes no responsibility for what you do with these accounts.",
+        description="Crimson Gen has agreed to only distribute accounts they own. Crimson Gen takes no responsibility for what you do with these accounts.",
         color=discord.Color.blue()
     )
-
     embed.set_thumbnail(url="https://cdn.discordapp.com/attachments/1470798856085307423/1471984801266532362/IMG_7053.gif")
-
-    embed.add_field(
-        name="🔐 Account Details",
-        value=f"`{user}:{pwd}`",
-        inline=False
-    )
-
-    embed.add_field(
-        name="🎮 Games",
-        value=games if len(games) < 1024 else games[:1021] + "...",
-        inline=False
-    )
-
-    embed.set_footer(text=f"Enjoy! ❤️")
+    embed.add_field(name="🔐 Account Details", value=f"`{user}:{pwd}`", inline=False)
+    embed.add_field(name="🎮 Games", value=games if len(games) < 1024 else games[:1021] + "...", inline=False)
+    embed.set_footer(text="Enjoy! ❤️")
 
     try:
         await interaction.user.send(embed=embed)
-        await interaction.followup.send(
-            "✅ Account sent to your DMs!",
-            ephemeral=True
-        )
+        await interaction.followup.send("✅ Account sent to your DMs!", ephemeral=True)
     except discord.Forbidden:
         await interaction.followup.send(
-            f"❌ Couldn't send DM. Please enable DMs from server members.\n\n"
-            f"**Account:** `{user}:{pwd}`",
+            f"❌ Couldn't send DM. Please enable DMs from server members.\n\n**Account:** `{user}:{pwd}`",
             ephemeral=True
         )
 
 
 @bot.tree.command(name="listgames", description="View available games")
 async def listgames(interaction: discord.Interaction):
-    with db() as con:
-        cur = con.cursor()
-        cur.execute("SELECT DISTINCT games FROM accounts")
-        rows = cur.fetchall()
-
+    stock = load_stock()
     games = sorted({
         g.strip()
-        for (row,) in rows
-        for g in row.split(",")
+        for acc in stock
+        for g in acc["games"].split(",")
         if g.strip()
     })
 
@@ -361,12 +329,8 @@ async def listgames(interaction: discord.Interaction):
         return
 
     pages = []
-    chunk = 15
-    for i in range(0, len(games), chunk):
-        pages.append(
-            "🎮 **Available Games**\n" +
-            "\n".join(games[i:i + chunk])
-        )
+    for i in range(0, len(games), 15):
+        pages.append("🎮 **Available Games**\n" + "\n".join(games[i:i + 15]))
 
     view = GameView(interaction.user.id, pages)
     view.update()
@@ -375,27 +339,18 @@ async def listgames(interaction: discord.Interaction):
 
 @bot.tree.command(name="search", description="Search stock for a game")
 async def search(interaction: discord.Interaction, game: str):
-    with db() as con:
-        cur = con.cursor()
-        cur.execute(
-            "SELECT COUNT(*) FROM accounts WHERE games LIKE ?",
-            (f"%{game}%",)
-        )
-        count = cur.fetchone()[0]
-
-    await interaction.response.send_message(
-        f"🔍 **{game}** stock: **{count}**"
-    )
+    stock = load_stock()
+    count = sum(1 for a in stock if game.lower() in a["games"].lower())
+    await interaction.response.send_message(f"🔍 **{game}** stock: **{count}**")
 
 
 @bot.tree.command(name="stock", description="View total available accounts")
-async def stock(interaction: discord.Interaction):
-    await interaction.response.defer()
+async def stock_cmd(interaction: discord.Interaction):
+    stock = load_stock()
+    total = len(stock)
 
     with db() as con:
         cur = con.cursor()
-        cur.execute("SELECT COUNT(*) FROM accounts")
-        total = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM reports")
         reported = cur.fetchone()[0]
 
@@ -404,8 +359,7 @@ async def stock(interaction: discord.Interaction):
     embed = discord.Embed(title="📦 Stock", color=discord.Color.blue())
     embed.add_field(name="✅ Available", value=f"**{available}** account(s)", inline=False)
     embed.add_field(name="🚨 Reported", value=f"**{reported}** account(s)", inline=False)
-
-    await interaction.followup.send(embed=embed)
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="mystats", description="View your stats")
@@ -448,18 +402,10 @@ async def topusers(interaction: discord.Interaction):
 @bot.tree.command(name="referral_create", description="Create your referral code")
 async def referral_create(interaction: discord.Interaction):
     code = "".join(str(random.randint(0, 9)) for _ in range(8))
-
     with db() as con:
         cur = con.cursor()
-        cur.execute(
-            "INSERT OR IGNORE INTO referrals VALUES (?,?)",
-            (interaction.user.id, code)
-        )
-
-    await interaction.response.send_message(
-        f"🎁 **Your Referral Code:** `{code}`",
-        ephemeral=True
-    )
+        cur.execute("INSERT OR IGNORE INTO referrals VALUES (?,?)", (interaction.user.id, code))
+    await interaction.response.send_message(f"🎁 **Your Referral Code:** `{code}`", ephemeral=True)
 
 
 @bot.tree.command(name="refer", description="Redeem a referral code")
@@ -472,20 +418,12 @@ async def refer(interaction: discord.Interaction, code: str):
         cur = con.cursor()
         cur.execute("SELECT owner_id FROM referrals WHERE code=?", (code,))
         row = cur.fetchone()
-
         if not row:
             await interaction.response.send_message("❌ Code not found.", ephemeral=True)
             return
+        cur.execute("INSERT OR IGNORE INTO referral_uses VALUES (?)", (interaction.user.id,))
 
-        cur.execute(
-            "INSERT OR IGNORE INTO referral_uses VALUES (?)",
-            (interaction.user.id,)
-        )
-
-    await interaction.response.send_message(
-        "✅ Referral redeemed! +1 daily gen.",
-        ephemeral=True
-    )
+    await interaction.response.send_message("✅ Referral redeemed! +1 daily gen.", ephemeral=True)
 
 
 @bot.tree.command(name="boostinfo", description="Boost perks info")
@@ -503,17 +441,8 @@ async def boostinfo(interaction: discord.Interaction):
 @bot.tree.command(name="report", description="Report a bad account")
 async def report(interaction: discord.Interaction, account: str, reason: str = "Invalid"):
     with db() as con:
-        con.execute(
-            "INSERT INTO reports VALUES (?,?)",
-            (account, reason)
-        )
-
-    await interaction.response.send_message(
-        "🚨 Report submitted.",
-        ephemeral=True
-    )
-
-
+        con.execute("INSERT INTO reports VALUES (?,?)", (account, reason))
+    await interaction.response.send_message("🚨 Report submitted.", ephemeral=True)
 
 # ================= STAFF COMMANDS =================
 
@@ -532,77 +461,51 @@ async def restock(interaction: discord.Interaction, file: discord.Attachment):
         await interaction.followup.send(f"❌ Failed to read file: {e}", ephemeral=True)
         return
 
-    parsed_accounts = parse_file(text)
-    added = 0
-    game_counts = {}
-
-    with db() as con:
-        cur = con.cursor()
-        for user, pwd, games in parsed_accounts:
-            try:
-                cur.execute(
-                    "INSERT INTO accounts (username, password, games, used) VALUES (?, ?, ?, 0)",
-                    (user, pwd, games)
-                )
-                added += 1
-                game_counts[games] = game_counts.get(games, 0) + 1
-            except Exception:
-                pass
-        con.commit()
-
-    if added == 0:
+    parsed = parse_file(text)
+    if not parsed:
         await interaction.followup.send("❌ No valid accounts found in file.", ephemeral=True)
         return
 
-    embed = discord.Embed(
-        title="🔄 Restock Complete",
-        color=discord.Color.green()
-    )
+    accounts = [{"username": u, "password": p, "games": g} for u, p, g in parsed]
+    added = add_accounts_to_stock(accounts)
 
+    game_counts = {}
+    for acc in accounts:
+        for g in acc["games"].split(","):
+            g = g.strip()
+            if g:
+                game_counts[g] = game_counts.get(g, 0) + 1
+
+    embed = discord.Embed(title="🔄 Restock Complete", color=discord.Color.green())
     stock_lines = "\n".join(
         f"**{game}:** `{count}` added"
         for game, count in sorted(game_counts.items(), key=lambda x: x[0].lower())
     )
     embed.add_field(name="📦 Games Added", value=stock_lines or "None", inline=False)
-    embed.set_footer(text=f"✅ {added} account(s) added")
-
+    embed.set_footer(text=f"✅ {added} new account(s) added to stock.json")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="removeaccount", description="Remove an account")
 @app_commands.check(staff_only)
 async def removeaccount(interaction: discord.Interaction, account: str):
-    with db() as con:
-        cur = con.cursor()
-        cur.execute("DELETE FROM accounts WHERE username||':'||password=?", (account,))
-        removed = cur.rowcount
-
-    await interaction.response.send_message(
-        f"🗑️ Removed **{removed}** account(s).",
-        ephemeral=True
-    )
+    stock = load_stock()
+    new_stock = [a for a in stock if f"{a['username']}:{a['password']}" != account]
+    removed = len(stock) - len(new_stock)
+    save_stock(new_stock)
+    await interaction.response.send_message(f"🗑️ Removed **{removed}** account(s).", ephemeral=True)
 
 
 @bot.tree.command(name="accountinfo", description="View account info")
 @app_commands.check(staff_only)
 async def accountinfo(interaction: discord.Interaction, account: str):
-    with db() as con:
-        cur = con.cursor()
-        cur.execute(
-            "SELECT games, used FROM accounts WHERE username||':'||password=?",
-            (account,)
-        )
-        row = cur.fetchone()
-
-    if not row:
+    stock = load_stock()
+    found = next((a for a in stock if f"{a['username']}:{a['password']}" == account), None)
+    if not found:
         await interaction.response.send_message("❌ Account not found.", ephemeral=True)
         return
-
-    games, used = row
     await interaction.response.send_message(
-        f"ℹ️ **Account Info**\n"
-        f"Games: `{games}`\n"
-        f"Used: `{bool(used)}`",
+        f"ℹ️ **Account Info**\nGames: `{found['games']}`",
         ephemeral=True
     )
 
@@ -622,7 +525,6 @@ async def reportedaccounts(interaction: discord.Interaction):
     msg = "🚨 **Reported Accounts**\n"
     for acc, reason in rows:
         msg += f"`{acc}` — {reason}\n"
-
     await interaction.response.send_message(msg)
 
 
@@ -632,11 +534,7 @@ async def resetreport(interaction: discord.Interaction, account: str):
     with db() as con:
         cur = con.cursor()
         cur.execute("DELETE FROM reports WHERE account=?", (account,))
-
-    await interaction.response.send_message(
-        "✅ Report cleared.",
-        ephemeral=True
-    )
+    await interaction.response.send_message("✅ Report cleared.", ephemeral=True)
 
 
 @bot.tree.command(name="resetallreports", description="Clear all reports")
@@ -644,29 +542,26 @@ async def resetreport(interaction: discord.Interaction, account: str):
 async def resetallreports(interaction: discord.Interaction):
     with db() as con:
         con.execute("DELETE FROM reports")
-
-    await interaction.response.send_message(
-        "✅ All reports cleared.",
-        ephemeral=True
-    )
+    await interaction.response.send_message("✅ All reports cleared.", ephemeral=True)
 
 
 @bot.tree.command(name="globalstats", description="View bot stats")
 @app_commands.check(staff_only)
 async def globalstats(interaction: discord.Interaction):
+    stock = load_stock()
+    total = len(stock)
+
     with db() as con:
         cur = con.cursor()
-        cur.execute("SELECT COUNT(*) FROM accounts")
-        total = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM accounts WHERE used=0")
-        available = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM reports")
+        reported = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM gens")
         gens = cur.fetchone()[0]
 
     await interaction.response.send_message(
         f"🌍 **Global Stats**\n"
         f"Total accounts: **{total}**\n"
-        f"Available: **{available}**\n"
+        f"Reported: **{reported}**\n"
         f"Total gens: **{gens}**",
         ephemeral=True
     )
