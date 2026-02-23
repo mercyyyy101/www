@@ -234,7 +234,7 @@ async def on_ready():
     await bot.tree.sync()
     await bot.change_presence(
         activity=discord.Game(name="🎮 Generating Steam accounts"),
-        status=discord.Status.online
+        status=discord.Status.invisible
     )
     print(f"✅ Logged in as {bot.user}")
 
